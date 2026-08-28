@@ -194,7 +194,7 @@ mode_label = st.sidebar.radio(
     index=0 if st.session_state.layout_mode == "desktop" else 1,
     horizontal=True,
 )
-is_mobile = (mode_label == "🖥 デスクトップ"の場合 False else True) # 簡略判定
+is_mobile = (mode_label == "🖥 デスクトップ" False else True) # 簡略判定
 if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.session_state.layout_mode:
     st.session_state.layout_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
     st.rerun()
