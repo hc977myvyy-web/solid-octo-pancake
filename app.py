@@ -23,14 +23,14 @@ if "use_per" not in st.session_state:
     st.session_state.use_per = True
 if "max_per" not in st.session_state:
     st.session_state.max_per = 15.0
-if "use_roe" not in st.session_state:
-    st.session_state.use_roe = True
-if "min_roe" not in st.session_state:
-    st.session_state.min_roe = 8.0
 if "use_psr" not in st.session_state:
     st.session_state.use_psr = False
 if "max_psr" not in st.session_state:
     st.session_state.max_psr = 5.0
+if "use_roe" not in st.session_state:
+    st.session_state.use_roe = True
+if "min_roe" not in st.session_state:
+    st.session_state.min_roe = 8.0
 if "use_yield" not in st.session_state:
     st.session_state.use_yield = False
 if "min_yield" not in st.session_state:
@@ -226,17 +226,17 @@ with st.container(border=True):
     with p3:
         st.session_state.min_range = st.number_input("レンジ下限(%)", min_value=0.0, value=st.session_state.min_range, step=1.0)
 
-    # 3段目：財務指標フィルター
+    # 3段目：財務指標フィルター（PER、PSR、ROE、配当利回りの順）
     t1, t2, t3, t4 = st.columns(4)
     with t1:
         st.session_state.use_per = st.checkbox("PER制限", value=st.session_state.use_per)
         st.session_state.max_per = st.number_input("PER上限(倍)", min_value=0.0, value=st.session_state.max_per, step=1.0)
     with t2:
-        st.session_state.use_roe = st.checkbox("ROE制限", value=st.session_state.use_roe)
-        st.session_state.min_roe = st.number_input("ROE下限(%)", min_value=0.0, value=st.session_state.min_roe, step=1.0)
-    with t3:
         st.session_state.use_psr = st.checkbox("PSR制限", value=st.session_state.use_psr)
         st.session_state.max_psr = st.number_input("PSR上限(倍)", min_value=0.0, value=st.session_state.max_psr, step=1.0)
+    with t3:
+        st.session_state.use_roe = st.checkbox("ROE制限", value=st.session_state.use_roe)
+        st.session_state.min_roe = st.number_input("ROE下限(%)", min_value=0.0, value=st.session_state.min_roe, step=1.0)
     with t4:
         st.session_state.use_yield = st.checkbox("配当利回り制限", value=st.session_state.use_yield)
         st.session_state.min_yield = st.number_input("利回り下限(%)", min_value=0.0, value=st.session_state.min_yield, step=1.0)
@@ -308,10 +308,10 @@ with tab_screen:
                         
                         if st.session_state.use_per:
                             per_ok = (data['PER'] is not None) and (data['PER'] <= st.session_state.max_per)
-                        if st.session_state.use_roe:
-                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= st.session_state.min_roe)
                         if st.session_state.use_psr:
                             psr_ok = (data['PSR'] is not None) and (data['PSR'] <= st.session_state.max_psr)
+                        if st.session_state.use_roe:
+                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= st.session_state.min_roe)
                         if st.session_state.use_yield:
                             yield_ok = (data['Yield'] is not None) and (data['Yield'] >= st.session_state.min_yield)
                             
@@ -328,8 +328,8 @@ with tab_screen:
                                 "業種": row['33業種区分'],
                                 "規模": row['規模'],
                                 "PER (倍)": round(data['PER'], 2) if data['PER'] else "-",
-                                "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
                                 "PSR (倍)": round(data['PSR'], 2) if data['PSR'] else "-",
+                                "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
                                 "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
                             })
                 
@@ -355,7 +355,7 @@ with tab_screen:
                     )
                     
                     for res in final_results:
-                        msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / ROE: {res['ROE (%)']}% / PSR: {res['PSR (倍)']} / 配当利回り: {res['配当利回り (%)']}%"
+                        msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / PSR: {res['PSR (倍)']} / ROE: {res['ROE (%)']}% / 配当利回り: {res['配当利回り (%)']}%"
                         send_discord_notify(msg)
                 else:
                     st.warning("⚠️ 指定した財務条件をすべてクリアした銘柄はありませんでした。")
