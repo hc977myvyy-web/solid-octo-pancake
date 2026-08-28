@@ -8,12 +8,27 @@ import concurrent.futures
 if "layout_mode" not in st.session_state:
     st.session_state.layout_mode = "desktop"
 
+# --- サイドバーの開閉状態をセッションに保持（スマホでスクリーニング開始時に引っ込めるため） ---
+if "sidebar_state" not in st.session_state:
+    st.session_state.sidebar_state = "expanded"
+
+# --- スクリーニング結果をセッションに保持（サイドバー引っ込め用の再実行後も結果を表示し続けるため） ---
+if "screening_results" not in st.session_state:
+    st.session_state.screening_results = None
+if "screening_summary" not in st.session_state:
+    st.session_state.screening_summary = None
+
 # --- ページ設定（表示モードに応じて横幅を切り替え。必ず最初のst命令にする） ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
     page_icon="📈",
-    layout="wide" if st.session_state.layout_mode == "desktop" else "centered"
+    layout="wide" if st.session_state.layout_mode == "desktop" else "centered",
+    initial_sidebar_state=st.session_state.sidebar_state,
 )
+
+# --- "collapsed" は今回の描画だけに適用し、以降はユーザーが手動で開閉できるよう戻す ---
+if st.session_state.sidebar_state == "collapsed":
+    st.session_state.sidebar_state = "auto"
 
 # --- 設定 ---
 try:
@@ -72,21 +87,51 @@ def load_market_caps(codes):
 
     return cap_df[['code', '規模']]
 
-def check_ytd_low(code):
+
+def check_ytd_low(code, min_recent5_avg_volume=1000, max_zero_volume_ratio=0.3, min_range_pct=0.0):
+    """
+    年初来安値を更新しているかを判定する。
+    あわせて「値動きがほとんどない」閑散銘柄を除外するため、以下も判定する:
+      - 直近5営業日の平均出来高が min_recent5_avg_volume 未満 → 除外
+      - 年初来データのうち出来高ゼロの日の割合が max_zero_volume_ratio を超える → 除外
+      - 年初来の値幅(高値-安値)/安値(%) が min_range_pct 未満 → 除外
+    """
     try:
         ticker = yf.Ticker(f"{code}.T")
         hist = ticker.history(period="ytd")
         if len(hist) < 2:
             return None
-        
+
+        # --- 直近5営業日の平均出来高フィルター ---
+        recent5 = hist['Volume'].tail(5)
+        recent5_avg_volume = recent5.mean()
+        if pd.isna(recent5_avg_volume) or recent5_avg_volume < min_recent5_avg_volume:
+            return None
+
+        # --- 出来高ゼロの日が多い銘柄を除外 ---
+        zero_volume_days = (hist['Volume'] == 0).sum()
+        zero_volume_ratio = zero_volume_days / len(hist)
+        if zero_volume_ratio > max_zero_volume_ratio:
+            return None
+
         ytd_low = hist['Low'].min()
+        ytd_high = hist['High'].max()
         latest_low = hist['Low'].iloc[-1]
-        
+
+        # --- 値動きの小ささ（レンジ）フィルター ---
+        if min_range_pct > 0:
+            if ytd_low <= 0:
+                return None
+            range_pct = (ytd_high - ytd_low) / ytd_low * 100
+            if range_pct < min_range_pct:
+                return None
+
         if latest_low <= ytd_low:
             return code
     except:
         pass
     return None
+
 
 def get_fundamentals(code):
     try:
@@ -138,6 +183,27 @@ def render_link_table(display_df):
         hide_index=True
     )
 
+def render_filter_multiselect(label, options, state_key, is_mobile):
+    """複数選択フィルターを「全選択／全解除」ボタン付きで描画する"""
+    if state_key not in st.session_state:
+        st.session_state[state_key] = list(options)
+
+    if is_mobile:
+        b1, b2 = st.columns(2)
+    else:
+        b1, b2, _ = st.columns([1, 1, 3])
+
+    if b1.button("全選択", key=f"{state_key}_all", use_container_width=True):
+        st.session_state[state_key] = list(options)
+        st.rerun()
+    if b2.button("全解除", key=f"{state_key}_none", use_container_width=True):
+        st.session_state[state_key] = []
+        st.rerun()
+
+    selected = st.multiselect(label, options, key=state_key)
+    st.caption(f"{len(selected)} / {len(options)} 件選択中")
+    return selected
+
 def render_condition(label, number_label, default_check, default_value, is_mobile, key_prefix):
     """財務条件1行を、PCなら横並び／スマホなら縦積みで描画する"""
     if is_mobile:
@@ -187,6 +253,19 @@ if not df_jpx.empty:
 
     with st.sidebar.expander("② 価格条件", expanded=True):
         use_ytd_low = st.checkbox("年初来安値を更新している銘柄のみ", value=True)
+        st.caption("値動きの乏しい閑散銘柄を除外するフィルター")
+        min_recent5_avg_volume = st.number_input(
+            "直近5日平均出来高の下限(株)", min_value=0, value=1000, step=500,
+            help="直近5営業日の平均出来高がこれ未満の銘柄は除外します"
+        )
+        max_zero_volume_ratio_pct = st.slider(
+            "年初来の出来高ゼロ日の許容割合(%)", min_value=0, max_value=100, value=30, step=5,
+            help="年初来データのうち出来高ゼロだった日の割合がこれを超える銘柄は除外します"
+        )
+        min_range_pct = st.number_input(
+            "年初来レンジ(高値-安値)の下限(%)", min_value=0.0, value=0.0, step=0.5,
+            help="0にすると無効。値を入れると、年初来の値幅が小さすぎる銘柄も除外します"
+        )
 
     with st.sidebar.expander("③ 財務条件", expanded=True):
         use_per, max_per = render_condition("PER", "PER上限(倍)", True, 15.0, is_mobile, "per")
@@ -220,14 +299,24 @@ with tab_screen:
         if len(codes) == 0:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。市場・業種・規模の条件を見直してください。")
         else:
-            # --- 年初来安値の条件 ---
+            # --- 年初来安値の条件（＋出来高フィルター） ---
             if use_ytd_low:
                 progress_text = "株価データをチェック中..."
                 my_bar = st.progress(0, text=progress_text)
                 ytd_low_codes = []
-                
+                max_zero_volume_ratio = max_zero_volume_ratio_pct / 100.0
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    futures = {executor.submit(check_ytd_low, code): code for code in codes}
+                    futures = {
+                        executor.submit(
+                            check_ytd_low,
+                            code,
+                            min_recent5_avg_volume,
+                            max_zero_volume_ratio,
+                            min_range_pct
+                        ): code
+                        for code in codes
+                    }
                     for i, future in enumerate(concurrent.futures.as_completed(futures)):
                         result = future.result()
                         if result:
@@ -242,11 +331,11 @@ with tab_screen:
             with st.container(border=True):
                 if is_mobile:
                     st.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    st.metric("② 年初来安値条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+                    st.metric("② 年初来安値＆出来高条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
                 else:
                     c1, c2 = st.columns(2)
                     c1.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    c2.metric("② 年初来安値条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+                    c2.metric("② 年初来安値＆出来高条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
 
             if len(ytd_low_codes) > 0:
                 final_results = []
