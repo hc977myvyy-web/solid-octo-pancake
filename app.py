@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import concurrent.futures
-from google import genai
+from openai import OpenAI
 
 # --- セッションステートの初期化 ---
 if "layout_mode" not in st.session_state:
@@ -28,17 +28,17 @@ st.set_page_config(
     layout="wide" if st.session_state.layout_mode == "desktop" else "centered",
 )
 
-# --- 設定 (Discord & Gemini API) ---
+# --- 設定 (Discord & OpenAI API) ---
 try:
     DISCORD_WEBHOOK_URL = st.secrets["DISCORD_WEBHOOK_URL"]
 except Exception:
     DISCORD_WEBHOOK_URL = ""
 
 try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception:
-    ai_client = None
+    openai_client = None
 
 @st.cache_data(ttl=86400)
 def load_jpx_data():
@@ -138,8 +138,8 @@ def send_discord_notify(msg):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
 def get_ai_summary(company_name, code, metrics, summary):
-    if not ai_client:
-        return "⚠️ Gemini APIキーが設定されていません（Streamlit Secretsの 'GEMINI_API_KEY' を確認してください）。"
+    if not openai_client:
+        return "⚠️ OpenAI APIキーが設定されていません（Streamlit Secretsの 'OPENAI_API_KEY' を確認してください）。"
     
     prompt = f"""
     以下の企業について、個人投資家向けにファンダメンタル分析を簡潔にまとめてください。
@@ -158,13 +158,17 @@ def get_ai_summary(company_name, code, metrics, summary):
     3. **注目ポイント**: 
     """
     try:
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "あなたは優秀な日本株のアナリストです。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
         )
-        return response.text
+        return response.choices[0].message.content
     except Exception as e:
-        return f"AI要約の生成に失敗しました: {e}"
+        return f"ChatGPTによる要約の生成に失敗しました: {e}"
 
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
@@ -351,20 +355,16 @@ with tab_screen:
                         hide_index=True
                     )
                     
-                    # --- 各企業名の下に分析結果が出る見やすいデザイン ---
-                    st.markdown("### 🤖 抽出銘柄のGemini AIファンダメンタル分析")
+                    st.markdown("### 🤖 抽出銘柄のChatGPTファンダメンタル分析")
                     for res in final_results:
                         with st.container(border=True):
-                            # 企業名・コードを大きく表示
                             c_col1, c_col2 = st.columns([3, 1])
                             c_col1.markdown(f"#### 🏢 {res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
                             c_col2.markdown(f"**規模:** {res['規模']}")
                             
-                            # 指標バッジ風表示
                             st.caption(f"📊 指標 | PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%** | 配当利回り: **{res['配当利回り (%)']}%**")
                             
-                            # Geminiによる分析結果を直接展開または表示
-                            with st.expander("✨ Gemini AIによるファンダメンタル分析結果を見る"):
+                            with st.expander("✨ ChatGPTによるファンダメンタル分析結果を見る"):
                                 with st.spinner(f"{res['会社名']} の分析を生成中..."):
                                     summary_text = get_ai_summary(
                                         res['会社名'], 
@@ -393,13 +393,12 @@ with tab_screen:
 # タブ2: 全銘柄一覧 ＆ AI分析（規模別タブ）
 # ============================================================
 with tab_list:
-    st.markdown("規模区分ごとの全銘柄一覧です。気になる企業のコードを入力して個別にGemini AI分析を行うこともできます。")
+    st.markdown("規模区分ごとの全銘柄一覧です。気になる企業のコードを入力して個別にChatGPT分析を行うこともできます。")
     st.markdown("---")
 
     if not df_jpx.empty:
-        # 上部に個別検索用インプットを配置
         with st.container(border=True):
-            st.markdown("##### 🔍 任意銘柄のピンポイントGemini AI分析")
+            st.markdown("##### 🔍 任意銘柄のピンポイントChatGPT分析")
             search_code_input = st.text_input("銘柄コードを入力してください（例: 4792, 7203）", value="")
             if search_code_input:
                 target_row = df_jpx[df_jpx['コード'].astype(str) == search_code_input.strip()]
@@ -411,7 +410,7 @@ with tab_list:
                     
                     st.success(f"**対象企業: {c_name} ({search_code_input})** / 市場: {c_market} / 業種: {c_sector} / 規模: {c_size}")
                     
-                    with st.spinner("リアルタイムデータを取得してGeminiが分析中..."):
+                    with st.spinner("リアルタイムデータを取得してChatGPTが分析中..."):
                         fund_data = get_fundamentals(search_code_input.strip())
                         ai_res_text = get_ai_summary(
                             c_name, 
@@ -430,7 +429,6 @@ with tab_list:
 
         st.markdown("---")
         
-        # 規模別の全銘柄一覧タブ
         size_tab_large, size_tab_mid, size_tab_small = st.tabs([
             f"🔵 大型株（{len(df_jpx[df_jpx['規模'] == '大型株'])}件）",
             f"🟢 中型株（{len(df_jpx[df_jpx['規模'] == '中型株'])}件）",
@@ -447,9 +445,8 @@ with tab_list:
                     col_a, col_b = st.columns([3, 1])
                     col_a.markdown(f"**[{name}]({tv_url})** （コード: `{code}`） / 業種: {row['33業種区分']}")
                     
-                    # 各企業の下にAI分析を展開できるボタンを配置
-                    with st.expander("🤖 この企業のGemini AI分析を見る"):
-                        with st.spinner("AI分析を生成中..."):
+                    with st.expander("🤖 この企業のChatGPT分析を見る"):
+                        with st.spinner("ChatGPTが分析を生成中..."):
                             f_data = get_fundamentals(str(code))
                             res_text = get_ai_summary(
                                 name, 
@@ -465,13 +462,13 @@ with tab_list:
                             st.markdown(res_text)
 
         with size_tab_large:
-            st.caption("大型株の一覧と各企業のAI分析")
+            st.caption("大型株の一覧と各企業のChatGPT分析")
             render_all_list_with_ai(df_jpx[df_jpx['規模'] == '大型株'])
         with size_tab_mid:
-            st.caption("中型株の一覧と各企業のAI分析")
+            st.caption("中型株の一覧と各企業のChatGPT分析")
             render_all_list_with_ai(df_jpx[df_jpx['規模'] == '中型株'])
         with size_tab_small:
-            st.caption("小型株の一覧と各企業のAI分析")
+            st.caption("小型株の一覧と各企業のChatGPT分析")
             render_all_list_with_ai(df_jpx[df_jpx['規模'] == '小型株'])
     else:
         st.info("銘柄データが読み込まれていません。")
