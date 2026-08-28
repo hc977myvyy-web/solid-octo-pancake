@@ -1,6 +1,6 @@
-streamlit 
-yfinance 
+streamlit
+yfinance
 pandas
+openpyxl
 requests
-xlrd
-google-genai
+openai
