@@ -79,9 +79,9 @@ def load_market_caps(codes):
 
     return cap_df[['code', '規模']]
 
-def check_ytd_low(code, min_recent5_avg_volume, max_zero_volume_ratio, min_range_pct):
+def check_ytd_low(code, use_range, min_range_pct):
     """
-    年初来安値の更新判定 ＋ 閑散銘柄除外 ＋ 値動き率（レンジ）フィルター
+    年初来安値の更新判定 ＋ チェックが入っている場合のみ値動き率（レンジ）フィルターを適用
     """
     try:
         ticker = yf.Ticker(f"{code}.T")
@@ -89,31 +89,19 @@ def check_ytd_low(code, min_recent5_avg_volume, max_zero_volume_ratio, min_range
         if len(hist) < 2:
             return None
 
-        # 1. 出来高フィルター（直近5日平均）
-        recent5 = hist['Volume'].tail(5)
-        recent5_avg_volume = recent5.mean()
-        if pd.isna(recent5_avg_volume) or recent5_avg_volume < min_recent5_avg_volume:
-            return None
-
-        # 2. 出来高ゼロ日の許容割合
-        zero_volume_days = (hist['Volume'] == 0).sum()
-        zero_volume_ratio = zero_volume_days / len(hist)
-        if zero_volume_ratio > max_zero_volume_ratio:
-            return None
-
         ytd_low = hist['Low'].min()
         ytd_high = hist['High'].max()
         latest_low = hist['Low'].iloc[-1]
 
-        # 3. 値動き率（レンジ）フィルター：(高値 - 安値) ÷ 安値 ≧ 指定％
-        if min_range_pct > 0:
+        # 値動き率（レンジ）フィルター：チェックが有効な場合のみ判定
+        if use_range and min_range_pct > 0:
             if ytd_low <= 0:
                 return None
             range_pct = (ytd_high - ytd_low) / ytd_low * 100
             if range_pct < min_range_pct:
                 return None
 
-        # 4. 年初来安値の更新判定
+        # 年初来安値の更新判定
         if latest_low <= ytd_low:
             return code
     except:
@@ -215,22 +203,17 @@ if not df_jpx.empty:
         selected_sector = st.selectbox("業種", sector_options, index=0)
         selected_size = st.selectbox("規模（時価総額ベース）", size_options, index=0)
 
-    with st.sidebar.expander("② 価格・値動き率フィルター", expanded=True):
+    with st.sidebar.expander("② 価格条件（年初来安値・値動き率）", expanded=True):
         use_ytd_low = st.checkbox("年初来安値更新銘柄に絞る", value=True)
-        st.caption("山田コンサル並みの値動き・出来高条件を一括適用")
-        min_recent5_avg_volume = st.number_input(
-            "直近5日平均出来高の下限(株)", min_value=0, value=1000, step=500,
-            help="直近5営業日の平均出来高がこれ未満の銘柄は除外します"
-        )
-        max_zero_volume_ratio_pct = st.slider(
-            "年初来の出来高ゼロ日の許容割合(%)", min_value=0, max_value=100, value=30, step=5,
-            help="年初来データのうち出来高ゼロだった日の割合がこれを超える銘柄は除外します"
-        )
-        # ★ここを山田コンサル水準（例: 15.0%）に合わせやすく初期値を設定
-        min_range_pct = st.number_input(
-            "年初来レンジ(高値-安値)の下限(%)", min_value=0.0, value=15.0, step=1.0,
-            help="山田コンサル並みなら15.0%以上に設定すると、年間を通じて一定の値幅がある銘柄だけを狙えます"
-        )
+        
+        # 値動き率（レンジ）フィルターのチェックボックス式
+        if is_mobile:
+            use_range = st.checkbox("年初来レンジで絞る", value=True)
+            min_range_pct = st.number_input("レンジ下限(%)", min_value=0.0, value=15.0, step=1.0)
+        else:
+            rc1, rc2 = st.columns([1, 2])
+            use_range = rc1.checkbox("レンジ下限", value=True)
+            min_range_pct = rc2.number_input("レンジ下限(%)", min_value=0.0, value=15.0, step=1.0, label_visibility="collapsed")
 
     with st.sidebar.expander("③ 財務条件", expanded=True):
         use_per, max_per = render_condition("PER", "PER上限(倍)", True, 15.0, is_mobile, "per")
@@ -273,18 +256,16 @@ with tab_screen:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。市場・業種・規模の条件を見直してください。")
         else:
             if use_ytd_low:
-                progress_text = "株価データ＆値動き率フィルターをチェック中..."
+                progress_text = "株価データ＆値動き率をチェック中..."
                 my_bar = st.progress(0, text=progress_text)
                 ytd_low_codes = []
-                max_zero_volume_ratio = max_zero_volume_ratio_pct / 100.0
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                     futures = {
                         executor.submit(
                             check_ytd_low,
                             code,
-                            min_recent5_avg_volume,
-                            max_zero_volume_ratio,
+                            use_range,
                             min_range_pct
                         ): code
                         for code in codes
@@ -302,11 +283,11 @@ with tab_screen:
             with st.container(border=True):
                 if is_mobile:
                     st.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    st.metric("② 安値＆値動き率クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+                    st.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
                 else:
                     c1, c2 = st.columns(2)
                     c1.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    c2.metric("② 安値＆値動き率クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+                    c2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
 
             if len(ytd_low_codes) > 0:
                 final_results = []
