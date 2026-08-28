@@ -12,12 +12,6 @@ if "layout_mode" not in st.session_state:
 if "sidebar_state" not in st.session_state:
     st.session_state.sidebar_state = "expanded"
 
-# --- スクリーニング結果をセッションに保持（サイドバー引っ込め用の再実行後も結果を表示し続けるため） ---
-if "screening_results" not in st.session_state:
-    st.session_state.screening_results = None
-if "screening_summary" not in st.session_state:
-    st.session_state.screening_summary = None
-
 # --- ページ設定（表示モードに応じて横幅を切り替え。必ず最初のst命令にする） ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
@@ -87,28 +81,18 @@ def load_market_caps(codes):
 
     return cap_df[['code', '規模']]
 
-
 def check_ytd_low(code, min_recent5_avg_volume=1000, max_zero_volume_ratio=0.3, min_range_pct=0.0):
-    """
-    年初来安値を更新しているかを判定する。
-    あわせて「値動きがほとんどない」閑散銘柄を除外するため、以下も判定する:
-      - 直近5営業日の平均出来高が min_recent5_avg_volume 未満 → 除外
-      - 年初来データのうち出来高ゼロの日の割合が max_zero_volume_ratio を超える → 除外
-      - 年初来の値幅(高値-安値)/安値(%) が min_range_pct 未満 → 除外
-    """
     try:
         ticker = yf.Ticker(f"{code}.T")
         hist = ticker.history(period="ytd")
         if len(hist) < 2:
             return None
 
-        # --- 直近5営業日の平均出来高フィルター ---
         recent5 = hist['Volume'].tail(5)
         recent5_avg_volume = recent5.mean()
         if pd.isna(recent5_avg_volume) or recent5_avg_volume < min_recent5_avg_volume:
             return None
 
-        # --- 出来高ゼロの日が多い銘柄を除外 ---
         zero_volume_days = (hist['Volume'] == 0).sum()
         zero_volume_ratio = zero_volume_days / len(hist)
         if zero_volume_ratio > max_zero_volume_ratio:
@@ -118,7 +102,6 @@ def check_ytd_low(code, min_recent5_avg_volume=1000, max_zero_volume_ratio=0.3, 
         ytd_high = hist['High'].max()
         latest_low = hist['Low'].iloc[-1]
 
-        # --- 値動きの小ささ（レンジ）フィルター ---
         if min_range_pct > 0:
             if ytd_low <= 0:
                 return None
@@ -131,7 +114,6 @@ def check_ytd_low(code, min_recent5_avg_volume=1000, max_zero_volume_ratio=0.3, 
     except:
         pass
     return None
-
 
 def get_fundamentals(code):
     try:
@@ -183,29 +165,7 @@ def render_link_table(display_df):
         hide_index=True
     )
 
-def render_filter_multiselect(label, options, state_key, is_mobile):
-    """複数選択フィルターを「全選択／全解除」ボタン付きで描画する"""
-    if state_key not in st.session_state:
-        st.session_state[state_key] = list(options)
-
-    if is_mobile:
-        b1, b2 = st.columns(2)
-    else:
-        b1, b2, _ = st.columns([1, 1, 3])
-
-    if b1.button("全選択", key=f"{state_key}_all", use_container_width=True):
-        st.session_state[state_key] = list(options)
-        st.rerun()
-    if b2.button("全解除", key=f"{state_key}_none", use_container_width=True):
-        st.session_state[state_key] = []
-        st.rerun()
-
-    selected = st.multiselect(label, options, key=state_key)
-    st.caption(f"{len(selected)} / {len(options)} 件選択中")
-    return selected
-
 def render_condition(label, number_label, default_check, default_value, is_mobile, key_prefix):
-    """財務条件1行を、PCなら横並び／スマホなら縦積みで描画する"""
     if is_mobile:
         use = st.checkbox(label, value=default_check, key=f"{key_prefix}_chk")
         val = st.number_input(number_label, min_value=0.0, value=default_value, key=f"{key_prefix}_val")
@@ -241,15 +201,14 @@ if not df_jpx.empty:
     df_jpx = df_jpx.merge(size_df, left_on='コード_str', right_on='code', how='left')
     df_jpx['規模'] = df_jpx['規模'].fillna("小型株")
 
-    market_options = sorted(df_jpx['市場・商品区分'].unique().tolist())
-    sector_options = sorted(df_jpx['33業種区分'].unique().tolist())
-    size_options = ["大型株", "中型株", "小型株"]
+    market_options = ["すべて"] + sorted(df_jpx['市場・商品区分'].unique().tolist())
+    sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
+    size_options = ["すべて", "大型株", "中型株", "小型株"]
 
     with st.sidebar.expander("① 対象銘柄の条件", expanded=True):
-        st.caption("チェックを外すと、その項目は対象から除外されます")
-        selected_markets = st.multiselect("市場区分", market_options, default=market_options)
-        selected_sectors = st.multiselect("業種", sector_options, default=sector_options)
-        selected_sizes = st.multiselect("規模（時価総額ベース）", size_options, default=size_options)
+        selected_market = st.selectbox("市場区分", market_options, index=0)
+        selected_sector = st.selectbox("業種", sector_options, index=0)
+        selected_size = st.selectbox("規模（時価総額ベース）", size_options, index=0)
 
     with st.sidebar.expander("② 価格条件", expanded=True):
         use_ytd_low = st.checkbox("年初来安値を更新している銘柄のみ", value=True)
@@ -276,6 +235,11 @@ if not df_jpx.empty:
     st.sidebar.markdown("---")
     search_btn = st.sidebar.button("🚀 スクリーニング開始", type="primary", use_container_width=True)
 
+    # --- スマホ表示のとき、検索ボタンが押されたらサイドバーを自動で引っ込める ---
+    if search_btn and is_mobile:
+        st.session_state.sidebar_state = "collapsed"
+        st.rerun()
+
 # --- メイン画面（タブ構成） ---
 st.title("📈 年初来安値 ＆ 財務スクリーニングダッシュボード")
 
@@ -290,16 +254,20 @@ with tab_screen:
 
     if search_btn and not df_jpx.empty:
         target_df = df_jpx.copy()
-        target_df = target_df[target_df['市場・商品区分'].isin(selected_markets)]
-        target_df = target_df[target_df['33業種区分'].isin(selected_sectors)]
-        target_df = target_df[target_df['規模'].isin(selected_sizes)]
+        
+        # セレクトボックスの選択肢に応じた絞り込み
+        if selected_market != "すべて":
+            target_df = target_df[target_df['市場・商品区分'] == selected_market]
+        if selected_sector != "すべて":
+            target_df = target_df[target_df['33業種区分'] == selected_sector]
+        if selected_size != "すべて":
+            target_df = target_df[target_df['規模'] == selected_size]
             
         codes = target_df['コード'].astype(str).tolist()
 
         if len(codes) == 0:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。市場・業種・規模の条件を見直してください。")
         else:
-            # --- 年初来安値の条件（＋出来高フィルター） ---
             if use_ytd_low:
                 progress_text = "株価データをチェック中..."
                 my_bar = st.progress(0, text=progress_text)
@@ -327,7 +295,6 @@ with tab_screen:
             else:
                 ytd_low_codes = codes
 
-            # --- ここまでのサマリー表示 ---
             with st.container(border=True):
                 if is_mobile:
                     st.metric("① 対象銘柄数", f"{len(codes)} 件")
@@ -392,7 +359,6 @@ with tab_screen:
                         "会社名": None
                     }
                     if is_mobile:
-                        # スマホでは列数を減らして横スクロールを最小限に
                         column_config["市場"] = None
                         column_config["業種"] = None
                     
