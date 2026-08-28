@@ -139,7 +139,7 @@ def send_discord_notify(msg):
 
 def get_ai_summary(company_name, code, metrics, summary):
     if not ai_client:
-        return "⚠️ Gemini APIキーが設定されていません（secrets.tomlを確認してください）。"
+        return "⚠️ Gemini APIキーが設定されていません（Streamlit Secretsの 'GEMINI_API_KEY' を確認してください）。"
     
     prompt = f"""
     以下の企業について、個人投資家向けにファンダメンタル分析を簡潔にまとめてください。
@@ -165,36 +165,6 @@ def get_ai_summary(company_name, code, metrics, summary):
         return response.text
     except Exception as e:
         return f"AI要約の生成に失敗しました: {e}"
-
-def make_tradingview_link_df(sub_df, is_mobile):
-    display_rows = []
-    for _, row in sub_df.iterrows():
-        code = row['コード']
-        name = row['銘柄名']
-        tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{name}"
-        entry = {
-            "銘柄名": tv_url,
-            "コード": code,
-        }
-        if not is_mobile:
-            entry["市場"] = row['市場・商品区分']
-            entry["業種"] = row['33業種区分']
-        display_rows.append(entry)
-    return pd.DataFrame(display_rows)
-
-def render_link_table(display_df):
-    st.dataframe(
-        display_df,
-        column_config={
-            "銘柄名": st.column_config.LinkColumn(
-                "銘柄名 (クリックでTradingView/アプリへ)",
-                help="クリックしてチャートを確認",
-                display_text=r".*#(.+)"
-            ),
-        },
-        use_container_width=True,
-        hide_index=True
-    )
 
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
@@ -229,7 +199,6 @@ st.markdown("フィルターバーから条件を設定し、スクリーニン�
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
     
-    # 1段目：基本セグメント（市場・業種・規模）
     f1, f2, f3 = st.columns(3)
     with f1:
         st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
@@ -240,7 +209,6 @@ with st.container(border=True):
 
     st.markdown("---")
     
-    # 2段目：価格＆テクニカル条件
     p1, p2, p3 = st.columns([1.2, 1, 1.8])
     with p1:
         st.session_state.use_ytd = st.checkbox("年初来安値更新", value=st.session_state.use_ytd)
@@ -251,7 +219,6 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 3段目：財務指標フィルター（条件として絞り込みたい場合に使用）
     st.markdown("###### 💰 財務条件フィルター（制限をかけたい項目にチェックを入れてください）")
     t1, t2, t3, t4 = st.columns(4)
     with t1:
@@ -271,7 +238,7 @@ with st.container(border=True):
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
 st.markdown("---")
-tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧（規模別）"])
+tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧 ＆ AI分析"])
 
 # ============================================================
 # タブ1: スクリーニング実行
@@ -327,7 +294,6 @@ with tab_screen:
                     for future in concurrent.futures.as_completed(futures):
                         data = future.result()
                         
-                        # チェックボックスがONの場合のみ数値制限を適用する
                         per_ok = True
                         psr_ok = True
                         roe_ok = True
@@ -385,23 +351,33 @@ with tab_screen:
                         hide_index=True
                     )
                     
-                    # --- 各企業ごとのGemini AI要約セクション（常に全指標を表示） ---
+                    # --- 各企業名の下に分析結果が出る見やすいデザイン ---
                     st.markdown("### 🤖 抽出銘柄のGemini AIファンダメンタル分析")
                     for res in final_results:
-                        with st.expander(f"📌 {res['会社名']} ({res['コード']}) のAI要約を表示 (PER: {res['PER (倍)']}倍 / PSR: {res['PSR (倍)']}倍 / ROE: {res['ROE (%)']}% / 利回り: {res['配当利回り (%)']}%)"):
-                            with st.spinner("Geminiがファンダメンタル分析を生成中..."):
-                                summary_text = get_ai_summary(
-                                    res['会社名'], 
-                                    res['コード'], 
-                                    {
-                                        'PER': res['PER (倍)'], 
-                                        'PSR': res['PSR (倍)'], 
-                                        'ROE': res['ROE (%)'], 
-                                        'Yield': res['配当利回り (%)']
-                                    }, 
-                                    res['summary']
-                                )
-                                st.markdown(summary_text)
+                        with st.container(border=True):
+                            # 企業名・コードを大きく表示
+                            c_col1, c_col2 = st.columns([3, 1])
+                            c_col1.markdown(f"#### 🏢 {res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
+                            c_col2.markdown(f"**規模:** {res['規模']}")
+                            
+                            # 指標バッジ風表示
+                            st.caption(f"📊 指標 | PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%** | 配当利回り: **{res['配当利回り (%)']}%**")
+                            
+                            # Geminiによる分析結果を直接展開または表示
+                            with st.expander("✨ Gemini AIによるファンダメンタル分析結果を見る"):
+                                with st.spinner(f"{res['会社名']} の分析を生成中..."):
+                                    summary_text = get_ai_summary(
+                                        res['会社名'], 
+                                        res['コード'], 
+                                        {
+                                            'PER': res['PER (倍)'], 
+                                            'PSR': res['PSR (倍)'], 
+                                            'ROE': res['ROE (%)'], 
+                                            'Yield': res['配当利回り (%)']
+                                        }, 
+                                        res['summary']
+                                    )
+                                    st.markdown(summary_text)
 
                     for res in final_results:
                         msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / PSR: {res['PSR (倍)']} / ROE: {res['ROE (%)']}% / 配当利回り: {res['配当利回り (%)']}%"
@@ -411,27 +387,91 @@ with tab_screen:
             else:
                 st.warning("⚠️ 価格条件に合致する銘柄はありませんでした。")
     elif not search_btn:
-        st.info("👆 上部のフィルターバーで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
+        st.info("👆 上部のフィルターバーで条件を設定してコードのスクリーニングを実行してください。")
 
 # ============================================================
-# タブ2: 銘柄一覧（規模別）
+# タブ2: 全銘柄一覧 ＆ AI分析（規模別タブ）
 # ============================================================
 with tab_list:
-    st.markdown("規模区分ごとの全銘柄一覧です。銘柄名をクリックするとTradingViewが開きます。")
+    st.markdown("規模区分ごとの全銘柄一覧です。気になる企業のコードを入力して個別にGemini AI分析を行うこともできます。")
     st.markdown("---")
 
     if not df_jpx.empty:
+        # 上部に個別検索用インプットを配置
+        with st.container(border=True):
+            st.markdown("##### 🔍 任意銘柄のピンポイントGemini AI分析")
+            search_code_input = st.text_input("銘柄コードを入力してください（例: 4792, 7203）", value="")
+            if search_code_input:
+                target_row = df_jpx[df_jpx['コード'].astype(str) == search_code_input.strip()]
+                if not target_row.empty:
+                    c_name = target_row.iloc[0]['銘柄名']
+                    c_market = target_row.iloc[0]['市場・商品区分']
+                    c_sector = target_row.iloc[0]['33業種区分']
+                    c_size = target_row.iloc[0]['規模']
+                    
+                    st.success(f"**対象企業: {c_name} ({search_code_input})** / 市場: {c_market} / 業種: {c_sector} / 規模: {c_size}")
+                    
+                    with st.spinner("リアルタイムデータを取得してGeminiが分析中..."):
+                        fund_data = get_fundamentals(search_code_input.strip())
+                        ai_res_text = get_ai_summary(
+                            c_name, 
+                            search_code_input.strip(), 
+                            {
+                                'PER': round(fund_data['PER'], 2) if fund_data['PER'] else '-', 
+                                'PSR': round(fund_data['PSR'], 2) if fund_data['PSR'] else '-', 
+                                'ROE': round(fund_data['ROE'], 2) if fund_data['ROE'] else '-', 
+                                'Yield': round(fund_data['Yield'], 2) if fund_data['Yield'] else '-'
+                            }, 
+                            fund_data['summary']
+                        )
+                        st.markdown(ai_res_text)
+                else:
+                    st.error("該当する銘柄コードが見つかりませんでした。")
+
+        st.markdown("---")
+        
+        # 規模別の全銘柄一覧タブ
         size_tab_large, size_tab_mid, size_tab_small = st.tabs([
             f"🔵 大型株（{len(df_jpx[df_jpx['規模'] == '大型株'])}件）",
             f"🟢 中型株（{len(df_jpx[df_jpx['規模'] == '中型株'])}件）",
             f"⚪ 小型株（{len(df_jpx[df_jpx['規模'] == '小型株'])}件）",
         ])
 
+        def render_all_list_with_ai(sub_df):
+            for _, row in sub_df.iterrows():
+                code = row['コード']
+                name = row['銘柄名']
+                tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{name}"
+                
+                with st.container(border=True):
+                    col_a, col_b = st.columns([3, 1])
+                    col_a.markdown(f"**[{name}]({tv_url})** （コード: `{code}`） / 業種: {row['33業種区分']}")
+                    
+                    # 各企業の下にAI分析を展開できるボタンを配置
+                    with st.expander("🤖 この企業のGemini AI分析を見る"):
+                        with st.spinner("AI分析を生成中..."):
+                            f_data = get_fundamentals(str(code))
+                            res_text = get_ai_summary(
+                                name, 
+                                str(code), 
+                                {
+                                    'PER': round(f_data['PER'], 2) if f_data['PER'] else '-', 
+                                    'PSR': round(f_data['PSR'], 2) if f_data['PSR'] else '-', 
+                                    'ROE': round(f_data['ROE'], 2) if f_data['ROE'] else '-', 
+                                    'Yield': round(f_data['Yield'], 2) if f_data['Yield'] else '-'
+                                }, 
+                                f_data['summary']
+                            )
+                            st.markdown(res_text)
+
         with size_tab_large:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '大型株'], is_mobile))
+            st.caption("大型株の一覧と各企業のAI分析")
+            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '大型株'])
         with size_tab_mid:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '中型株'], is_mobile))
+            st.caption("中型株の一覧と各企業のAI分析")
+            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '中型株'])
         with size_tab_small:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '小型株'], is_mobile))
+            st.caption("小型株の一覧と各企業のAI分析")
+            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '小型株'])
     else:
         st.info("銘柄データが読み込まれていません。")
