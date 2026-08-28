@@ -4,24 +4,44 @@ import pandas as pd
 import requests
 import concurrent.futures
 
-# --- 表示モード（デスクトップ／スマホ）をセッションに保持 ---
+# --- セッションステートの初期化 ---
 if "layout_mode" not in st.session_state:
     st.session_state.layout_mode = "desktop"
-
-# --- サイドバーの開閉状態をセッションに保持 ---
-if "sidebar_state" not in st.session_state:
-    st.session_state.sidebar_state = "expanded"
+if "market_filter" not in st.session_state:
+    st.session_state.market_filter = "すべて"
+if "sector_filter" not in st.session_state:
+    st.session_state.sector_filter = "すべて"
+if "size_filter" not in st.session_state:
+    st.session_state.size_filter = "すべて"
+if "use_ytd" not in st.session_state:
+    st.session_state.use_ytd = True
+if "use_range" not in st.session_state:
+    st.session_state.use_range = True
+if "min_range" not in st.session_state:
+    st.session_state.min_range = 15.0
+if "use_per" not in st.session_state:
+    st.session_state.use_per = True
+if "max_per" not in st.session_state:
+    st.session_state.max_per = 15.0
+if "use_roe" not in st.session_state:
+    st.session_state.use_roe = True
+if "min_roe" not in st.session_state:
+    st.session_state.min_roe = 8.0
+if "use_psr" not in st.session_state:
+    st.session_state.use_psr = False
+if "max_psr" not in st.session_state:
+    st.session_state.max_psr = 5.0
+if "use_yield" not in st.session_state:
+    st.session_state.use_yield = False
+if "min_yield" not in st.session_state:
+    st.session_state.min_yield = 3.0
 
 # --- ページ設定 ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
     page_icon="📈",
     layout="wide" if st.session_state.layout_mode == "desktop" else "centered",
-    initial_sidebar_state=st.session_state.sidebar_state,
 )
-
-if st.session_state.sidebar_state == "collapsed":
-    st.session_state.sidebar_state = "auto"
 
 # --- 設定 ---
 try:
@@ -80,9 +100,6 @@ def load_market_caps(codes):
     return cap_df[['code', '規模']]
 
 def check_ytd_low(code, use_range, min_range_pct):
-    """
-    年初来安値の更新判定 ＋ チェックが入っている場合のみ値動き率（レンジ）フィルターを適用
-    """
     try:
         ticker = yf.Ticker(f"{code}.T")
         hist = ticker.history(period="ytd")
@@ -93,7 +110,6 @@ def check_ytd_low(code, use_range, min_range_pct):
         ytd_high = hist['High'].max()
         latest_low = hist['Low'].iloc[-1]
 
-        # 値動き率（レンジ）フィルター：チェックが有効な場合のみ判定
         if use_range and min_range_pct > 0:
             if ytd_low <= 0:
                 return None
@@ -101,7 +117,6 @@ def check_ytd_low(code, use_range, min_range_pct):
             if range_pct < min_range_pct:
                 return None
 
-        # 年初来安値の更新判定
         if latest_low <= ytd_low:
             return code
     except:
@@ -158,35 +173,8 @@ def render_link_table(display_df):
         hide_index=True
     )
 
-def render_condition(label, number_label, default_check, default_value, is_mobile, key_prefix):
-    if is_mobile:
-        use = st.checkbox(label, value=default_check, key=f"{key_prefix}_chk")
-        val = st.number_input(number_label, min_value=0.0, value=default_value, key=f"{key_prefix}_val")
-    else:
-        c1, c2 = st.columns([1, 2])
-        use = c1.checkbox(label, value=default_check, key=f"{key_prefix}_chk")
-        val = c2.number_input(number_label, min_value=0.0, value=default_value, label_visibility="collapsed", key=f"{key_prefix}_val")
-    return use, val
-
-# --- サイドバー：表示モード切り替え ---
-st.sidebar.header("🔍 検索フィルター")
-
-mode_label = st.sidebar.radio(
-    "表示モード",
-    ["🖥 デスクトップ", "📱 スマホ"],
-    index=0 if st.session_state.layout_mode == "desktop" else 1,
-    horizontal=True,
-)
-new_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
-if new_mode != st.session_state.layout_mode:
-    st.session_state.layout_mode = new_mode
-    st.rerun()
-
-is_mobile = st.session_state.layout_mode == "mobile"
-st.sidebar.markdown("---")
-
+# --- データ読み込み ---
 df_jpx = load_jpx_data()
-
 if not df_jpx.empty:
     df_jpx['コード_str'] = df_jpx['コード'].astype(str)
     codes_all = tuple(df_jpx['コード_str'].tolist())
@@ -198,65 +186,88 @@ if not df_jpx.empty:
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
     size_options = ["すべて", "大型株", "中型株", "小型株"]
 
-    with st.sidebar.expander("① 対象銘柄の条件", expanded=True):
-        selected_market = st.selectbox("市場区分", market_options, index=0)
-        selected_sector = st.selectbox("業種", sector_options, index=0)
-        selected_size = st.selectbox("規模（時価総額ベース）", size_options, index=0)
+# --- サイドバー：表示モードのみに簡素化 ---
+st.sidebar.header("⚙️ 設定")
+mode_label = st.sidebar.radio(
+    "表示モード",
+    ["🖥 デスクトップ", "📱 スマホ"],
+    index=0 if st.session_state.layout_mode == "desktop" else 1,
+    horizontal=True,
+)
+is_mobile = (mode_label == "🖥 デスクトップ"の場合 False else True) # 簡略判定
+if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.session_state.layout_mode:
+    st.session_state.layout_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
+    st.rerun()
 
-    with st.sidebar.expander("② 価格条件（年初来安値・値動き率）", expanded=True):
-        use_ytd_low = st.checkbox("年初来安値更新銘柄に絞る", value=True)
-        
-        # 値動き率（レンジ）フィルターのチェックボックス式
-        if is_mobile:
-            use_range = st.checkbox("年初来レンジで絞る", value=True)
-            min_range_pct = st.number_input("レンジ下限(%)", min_value=0.0, value=15.0, step=1.0)
-        else:
-            rc1, rc2 = st.columns([1, 2])
-            use_range = rc1.checkbox("レンジ下限", value=True)
-            min_range_pct = rc2.number_input("レンジ下限(%)", min_value=0.0, value=15.0, step=1.0, label_visibility="collapsed")
+# --- メイン画面：TradingView風 上部フィルターパネル ---
+st.title("📈 株式スクリーニングダッシュボード")
+st.markdown("TradingView風のパネルから条件を選択し、スクリーニングを実行してください。")
 
-    with st.sidebar.expander("③ 財務条件", expanded=True):
-        use_per, max_per = render_condition("PER", "PER上限(倍)", True, 15.0, is_mobile, "per")
-        use_roe, min_roe = render_condition("ROE", "ROE下限(%)", True, 8.0, is_mobile, "roe")
-        use_psr, max_psr = render_condition("PSR", "PSR上限(倍)", False, 5.0, is_mobile, "psr")
-        use_yield, min_yield = render_condition("利回り", "利回り下限(%)", False, 3.0, is_mobile, "yield")
+with st.container(border=True):
+    st.markdown("##### 🎛️ TradingView風 フィルターバー")
     
-    st.sidebar.markdown("---")
-    search_btn = st.sidebar.button("🚀 スクリーニング開始", type="primary", use_container_width=True)
+    # 1段目：基本セグメント（市場・業種・規模）
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
+    with f2:
+        st.session_state.sector_filter = st.selectbox("業種", sector_options, index=sector_options.index(st.session_state.sector_filter) if st.session_state.sector_filter in sector_options else 0)
+    with f3:
+        st.session_state.size_filter = st.selectbox("規模（時価総額）", size_options, index=size_options.index(st.session_state.size_filter) if st.session_state.size_filter in size_options else 0)
 
-    if search_btn and is_mobile:
-        st.session_state.sidebar_state = "collapsed"
-        st.rerun()
+    st.markdown("---")
+    
+    # 2段目：価格＆テクニカル条件
+    p1, p2, p3 = st.columns([1.2, 1, 1.8])
+    with p1:
+        st.session_state.use_ytd = st.checkbox("年初来安値更新", value=st.session_state.use_ytd)
+    with p2:
+        st.session_state.use_range = st.checkbox("レンジ下限絞り", value=st.session_state.use_range)
+    with p3:
+        st.session_state.min_range = st.number_input("レンジ下限(%)", min_value=0.0, value=st.session_state.min_range, step=1.0)
 
-# --- メイン画面（タブ構成） ---
-st.title("📈 年初来安値 ＆ 財務スクリーニングダッシュボード")
+    # 3段目：財務指標フィルター
+    t1, t2, t3, t4 = st.columns(4)
+    with t1:
+        st.session_state.use_per = st.checkbox("PER制限", value=st.session_state.use_per)
+        st.session_state.max_per = st.number_input("PER上限(倍)", min_value=0.0, value=st.session_state.max_per, step=1.0)
+    with t2:
+        st.session_state.use_roe = st.checkbox("ROE制限", value=st.session_state.use_roe)
+        st.session_state.min_roe = st.number_input("ROE下限(%)", min_value=0.0, value=st.session_state.min_roe, step=1.0)
+    with t3:
+        st.session_state.use_psr = st.checkbox("PSR制限", value=st.session_state.use_psr)
+        st.session_state.max_psr = st.number_input("PSR上限(倍)", min_value=0.0, value=st.session_state.max_psr, step=1.0)
+    with t4:
+        st.session_state.use_yield = st.checkbox("配当利回り制限", value=st.session_state.use_yield)
+        st.session_state.min_yield = st.number_input("利回り下限(%)", min_value=0.0, value=st.session_state.min_yield, step=1.0)
 
-tab_screen, tab_list = st.tabs(["🔍 スクリーニング", "📋 銘柄一覧（規模別）"])
+    st.markdown("")
+    search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
+
+st.markdown("---")
+tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧（規模別）"])
 
 # ============================================================
-# タブ1: スクリーニング
+# タブ1: スクリーニング実行
 # ============================================================
 with tab_screen:
-    st.markdown("条件に合致するお宝銘柄をリアルタイムで抽出します。銘柄名をクリックするとTradingViewが開きます。")
-    st.markdown("---")
-
     if search_btn and not df_jpx.empty:
         target_df = df_jpx.copy()
         
-        if selected_market != "すべて":
-            target_df = target_df[target_df['市場・商品区分'] == selected_market]
-        if selected_sector != "すべて":
-            target_df = target_df[target_df['33業種区分'] == selected_sector]
-        if selected_size != "すべて":
-            target_df = target_df[target_df['規模'] == selected_size]
+        if st.session_state.market_filter != "すべて":
+            target_df = target_df[target_df['市場・商品区分'] == st.session_state.market_filter]
+        if st.session_state.sector_filter != "すべて":
+            target_df = target_df[target_df['33業種区分'] == st.session_state.sector_filter]
+        if st.session_state.size_filter != "すべて":
+            target_df = target_df[target_df['規模'] == st.session_state.size_filter]
             
         codes = target_df['コード'].astype(str).tolist()
 
         if len(codes) == 0:
-            st.warning("⚠️ 条件に合致する銘柄がありませんでした。市場・業種・規模の条件を見直してください。")
+            st.warning("⚠️ 条件に合致する銘柄がありませんでした。")
         else:
-            if use_ytd_low:
-                progress_text = "株価データ＆値動き率をチェック中..."
+            if st.session_state.use_ytd:
+                progress_text = "株価データ＆条件を解析中..."
                 my_bar = st.progress(0, text=progress_text)
                 ytd_low_codes = []
 
@@ -265,8 +276,8 @@ with tab_screen:
                         executor.submit(
                             check_ytd_low,
                             code,
-                            use_range,
-                            min_range_pct
+                            st.session_state.use_range,
+                            st.session_state.min_range
                         ): code
                         for code in codes
                     }
@@ -275,19 +286,14 @@ with tab_screen:
                         if result:
                             ytd_low_codes.append(result)
                         my_bar.progress((i + 1) / len(codes), text=f"{progress_text} ({i+1}/{len(codes)})")
-                
                 my_bar.empty()
             else:
                 ytd_low_codes = codes
 
-            with st.container(border=True):
-                if is_mobile:
-                    st.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    st.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
-                else:
-                    c1, c2 = st.columns(2)
-                    c1.metric("① 対象銘柄数", f"{len(codes)} 件")
-                    c2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+            # サマリーメトリクス
+            m1, m2 = st.columns(2)
+            m1.metric("① 対象銘柄数", f"{len(codes)} 件")
+            m2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件")
 
             if len(ytd_low_codes) > 0:
                 final_results = []
@@ -301,14 +307,14 @@ with tab_screen:
                         psr_ok = True
                         yield_ok = True
                         
-                        if use_per:
-                            per_ok = (data['PER'] is not None) and (data['PER'] <= max_per)
-                        if use_roe:
-                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= min_roe)
-                        if use_psr:
-                            psr_ok = (data['PSR'] is not None) and (data['PSR'] <= max_psr)
-                        if use_yield:
-                            yield_ok = (data['Yield'] is not None) and (data['Yield'] >= min_yield)
+                        if st.session_state.use_per:
+                            per_ok = (data['PER'] is not None) and (data['PER'] <= st.session_state.max_per)
+                        if st.session_state.use_roe:
+                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= st.session_state.min_roe)
+                        if st.session_state.use_psr:
+                            psr_ok = (data['PSR'] is not None) and (data['PSR'] <= st.session_state.max_psr)
+                        if st.session_state.use_yield:
+                            yield_ok = (data['Yield'] is not None) and (data['Yield'] >= st.session_state.min_yield)
                             
                         if per_ok and roe_ok and psr_ok and yield_ok:
                             row = target_df[target_df['コード'].astype(str) == data['code']].iloc[0]
@@ -328,14 +334,17 @@ with tab_screen:
                                 "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
                             })
                 
-                st.metric("🏆 最終条件クリア銘柄", f"{len(final_results)} 件")
                 st.markdown("---")
-                
                 if final_results:
                     st.success(f"🎉 条件をクリアしたお宝候補が **{len(final_results)}件** 見つかりました！")
                     result_df = pd.DataFrame(final_results)
 
                     column_config = {
+                        "銘柄 name": st.column_config.LinkColumn(
+                            "銘柄名 (クリックでTradingViewへ)",
+                            help="クリックしてチャート・財務を確認",
+                            display_text=r".*#(.+)"
+                        ),
                         "銘柄名": st.column_config.LinkColumn(
                             "銘柄名 (クリックでTradingViewへ)",
                             help="クリックしてチャート・財務を確認",
@@ -343,9 +352,6 @@ with tab_screen:
                         ),
                         "会社名": None
                     }
-                    if is_mobile:
-                        column_config["市場"] = None
-                        column_config["業種"] = None
                     
                     st.dataframe(
                         result_df,
@@ -358,17 +364,17 @@ with tab_screen:
                         msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / ROE: {res['ROE (%)']}% / PSR: {res['PSR (倍)']} / 配当利回り: {res['配当利回り (%)']}%"
                         send_discord_notify(msg)
                 else:
-                    st.warning("⚠️ 指定した条件をすべてクリアした銘柄はありませんでした（条件を少し緩めると見つかる場合があります）。")
+                    st.warning("⚠️ 指定した財務条件をすべてクリアした銘柄はありませんでした。")
             else:
-                st.warning("⚠️ 選択した市場・業種・規模の中で、条件に合致する銘柄はありませんでした。")
+                st.warning("⚠️ 価格条件に合致する銘柄はありませんでした。")
     elif not search_btn:
-        st.info("👈 サイドバーで条件を設定して「スクリーニング開始」ボタンを押してください。")
+        st.info("👆 上部のパネルで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
 
 # ============================================================
 # タブ2: 銘柄一覧（規模別）
 # ============================================================
 with tab_list:
-    st.markdown("検索条件に関わらず、**規模区分（大型株・中型株・小型株）ごとの全銘柄一覧**をいつでも確認できます。銘柄名をクリックするとTradingViewが開きます。")
+    st.markdown("規模区分ごとの全銘柄一覧です。銘柄名をクリックするとTradingViewが開きます。")
     st.markdown("---")
 
     if not df_jpx.empty:
@@ -380,11 +386,9 @@ with tab_list:
 
         with size_tab_large:
             render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '大型株'], is_mobile))
-
         with size_tab_mid:
             render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '中型株'], is_mobile))
-
         with size_tab_small:
             render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '小型株'], is_mobile))
     else:
-        st.info("銘柄データが読み込まれていません。data_j.xls を確認してください。")
+        st.info("銘柄データが読み込まれていません。")
