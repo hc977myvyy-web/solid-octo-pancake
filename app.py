@@ -88,7 +88,7 @@ def load_market_caps(codes):
     cap_df = cap_df.merge(ranked[['code', '規模']], on='code', how='left')
     cap_df['規模'] = cap_df['規模'].fillna("小型株")
 
-    return cap_df[['code', '规模' if '规模' in cap_df.columns else '規模']]
+    return cap_df[['code', '規模']]
 
 def check_ytd_low(code, use_range, min_range_pct):
     try:
@@ -229,6 +229,7 @@ st.markdown("フィルターバーから条件を設定し、スクリーニン�
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
     
+    # 1段目：基本セグメント（市場・業種・規模）
     f1, f2, f3 = st.columns(3)
     with f1:
         st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
@@ -239,6 +240,7 @@ with st.container(border=True):
 
     st.markdown("---")
     
+    # 2段目：価格＆テクニカル条件
     p1, p2, p3 = st.columns([1.2, 1, 1.8])
     with p1:
         st.session_state.use_ytd = st.checkbox("年初来安値更新", value=st.session_state.use_ytd)
@@ -246,6 +248,24 @@ with st.container(border=True):
         st.session_state.use_range = st.checkbox("レンジ下限絞り", value=st.session_state.use_range)
     with p3:
         st.session_state.min_range = st.number_input("レンジ下限(%)", min_value=0.0, value=st.session_state.min_range, step=1.0)
+
+    st.markdown("---")
+
+    # 3段目：財務指標フィルター（条件として絞り込みたい場合に使用）
+    st.markdown("###### 💰 財務条件フィルター（制限をかけたい項目にチェックを入れてください）")
+    t1, t2, t3, t4 = st.columns(4)
+    with t1:
+        use_per = st.checkbox("PER制限", value=True)
+        max_per = st.number_input("PER上限(倍)", min_value=0.0, value=15.0, step=1.0)
+    with t2:
+        use_psr = st.checkbox("PSR制限", value=False)
+        max_psr = st.number_input("PSR上限(倍)", min_value=0.0, value=5.0, step=1.0)
+    with t3:
+        use_roe = st.checkbox("ROE制限", value=True)
+        min_roe = st.number_input("ROE下限(%)", min_value=0.0, value=8.0, step=1.0)
+    with t4:
+        use_yield = st.checkbox("配当利回り制限", value=False)
+        min_yield = st.number_input("利回り下限(%)", min_value=0.0, value=3.0, step=1.0)
 
     st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
@@ -282,7 +302,7 @@ with tab_screen:
                         executor.submit(
                             check_ytd_low,
                             code,
-                    st.session_state.use_range,
+                            st.session_state.use_range,
                             st.session_state.min_range
                         ): code
                         for code in codes
@@ -306,25 +326,42 @@ with tab_screen:
                     futures = {executor.submit(get_fundamentals, code): code for code in ytd_low_codes}
                     for future in concurrent.futures.as_completed(futures):
                         data = future.result()
-                        row = target_df[target_df['コード'].astype(str) == data['code']].iloc[0]
-                        company_name = row['銘柄名']
-                        code = data['code']
                         
-                        tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{company_name}"
+                        # チェックボックスがONの場合のみ数値制限を適用する
+                        per_ok = True
+                        psr_ok = True
+                        roe_ok = True
+                        yield_ok = True
                         
-                        final_results.append({
-                            "コード": code,
-                            "銘柄名": tv_url,
-                            "会社名": company_name,
-                            "市場": row['市場・商品区分'],
-                            "業種": row['33業種区分'],
-                            "規模": row['規模'],
-                            "PER (倍)": round(data['PER'], 2) if data['PER'] else "-",
-                            "PSR (倍)": round(data['PSR'], 2) if data['PSR'] else "-",
-                            "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
-                            "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
-                            "summary": data['summary']
-                        })
+                        if use_per:
+                            per_ok = (data['PER'] is not None) and (data['PER'] <= max_per)
+                        if use_psr:
+                            psr_ok = (data['PSR'] is not None) and (data['PSR'] <= max_psr)
+                        if use_roe:
+                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= min_roe)
+                        if use_yield:
+                            yield_ok = (data['Yield'] is not None) and (data['Yield'] >= min_yield)
+                            
+                        if per_ok and psr_ok and roe_ok and yield_ok:
+                            row = target_df[target_df['コード'].astype(str) == data['code']].iloc[0]
+                            company_name = row['銘柄名']
+                            code = data['code']
+                            
+                            tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{company_name}"
+                            
+                            final_results.append({
+                                "コード": code,
+                                "銘柄名": tv_url,
+                                "会社名": company_name,
+                                "市場": row['市場・商品区分'],
+                                "業種": row['33業種区分'],
+                                "規模": row['規模'],
+                                "PER (倍)": round(data['PER'], 2) if data['PER'] else "-",
+                                "PSR (倍)": round(data['PSR'], 2) if data['PSR'] else "-",
+                                "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
+                                "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
+                                "summary": data['summary']
+                            })
                 
                 st.markdown("---")
                 if final_results:
@@ -348,10 +385,10 @@ with tab_screen:
                         hide_index=True
                     )
                     
-                    # --- 各企業ごとのGemini AI要約セクション ---
+                    # --- 各企業ごとのGemini AI要約セクション（常に全指標を表示） ---
                     st.markdown("### 🤖 抽出銘柄のGemini AIファンダメンタル分析")
                     for res in final_results:
-                        with st.expander(f"📌 {res['会社名']} ({res['コード']}) のAI要約を表示"):
+                        with st.expander(f"📌 {res['会社名']} ({res['コード']}) のAI要約を表示 (PER: {res['PER (倍)']}倍 / PSR: {res['PSR (倍)']}倍 / ROE: {res['ROE (%)']}% / 利回り: {res['配当利回り (%)']}%)"):
                             with st.spinner("Geminiがファンダメンタル分析を生成中..."):
                                 summary_text = get_ai_summary(
                                     res['会社名'], 
@@ -370,7 +407,7 @@ with tab_screen:
                         msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / PSR: {res['PSR (倍)']} / ROE: {res['ROE (%)']}% / 配当利回り: {res['配当利回り (%)']}%"
                         send_discord_notify(msg)
                 else:
-                    st.warning("⚠️ 該当する銘柄はありませんでした。")
+                    st.warning("⚠️ 指定した財務制限をすべてクリアした銘柄はありませんでした。")
             else:
                 st.warning("⚠️ 価格条件に合致する銘柄はありませんでした。")
     elif not search_btn:
