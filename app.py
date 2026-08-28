@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import concurrent.futures
+import time
 
 # --- セッションステートの初期化 ---
 if "layout_mode" not in st.session_state:
@@ -43,14 +44,43 @@ def load_jpx_data():
         st.error(f"銘柄データの取得に失敗しました: {e}")
         return pd.DataFrame()
 
-def get_market_cap(code):
-    try:
-        ticker = yf.Ticker(f"{code}.T")
-        info = ticker.info
-        cap = info.get('marketCap')
-        return {"code": code, "market_cap": cap}
-    except:
-        return {"code": code, "market_cap": None}
+
+def get_market_cap(code, max_retries=2):
+    """
+    時価総額を取得する。
+    - まず軽量な fast_info を試す(レート制限に引っかかりにくい)
+    - 失敗したら info にフォールバック
+    - それでも失敗したら少し待って最大 max_retries 回リトライ
+    - 最終的に失敗した場合はエラー内容も一緒に返す(握りつぶさない)
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            ticker = yf.Ticker(f"{code}.T")
+
+            # 1. fast_info を優先(軽量・高速・レート制限を受けにくい)
+            try:
+                cap = ticker.fast_info.get("market_cap")
+                if cap:
+                    return {"code": code, "market_cap": cap, "error": None}
+            except Exception:
+                pass  # fast_info がダメなら info にフォールバック
+
+            # 2. info にフォールバック
+            info = ticker.info
+            cap = info.get('marketCap')
+            if cap:
+                return {"code": code, "market_cap": cap, "error": None}
+
+            last_error = "marketCap が取得できませんでした"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < max_retries:
+            time.sleep(0.5 * (attempt + 1))  # 少しずつ待ってリトライ(レート制限対策)
+
+    return {"code": code, "market_cap": None, "error": last_error}
+
 
 @st.cache_data(ttl=86400)
 def load_market_caps(codes):
@@ -58,8 +88,8 @@ def load_market_caps(codes):
     progress_text = "時価総額データを取得中（全銘柄の規模分類を行っています）..."
     my_bar = st.progress(0, text=progress_text)
 
-    # タイムアウトや負荷対策として最大ワーカー数を設定
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # 並列数を下げてAPI負荷・レート制限を軽減(10→5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(get_market_cap, code): code for code in codes}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             results.append(future.result())
@@ -68,7 +98,17 @@ def load_market_caps(codes):
     my_bar.empty()
 
     cap_df = pd.DataFrame(results)
-    # 時価総額が大きい順にソートしてランキング付け
+
+    success_count = cap_df['market_cap'].notna().sum()
+    fail_count = len(cap_df) - success_count
+    if fail_count > 0:
+        st.warning(
+            f"⚠️ 時価総額の取得に失敗した銘柄が {fail_count} 件あります"
+            f"（成功 {success_count} / {len(cap_df)} 件）。"
+            "失敗した銘柄は「分類不可」として扱われ、規模フィルターでは除外されます。"
+        )
+
+    # 時価総額が大きい順にソートしてランキング付け(取得できたものだけ)
     ranked = cap_df.dropna(subset=['market_cap']).sort_values('market_cap', ascending=False).reset_index(drop=True)
 
     def classify_size(rank):
@@ -80,12 +120,18 @@ def load_market_caps(codes):
             return "小型株"
 
     ranked['規模'] = [classify_size(i) for i in range(len(ranked))]
-    
+
     # 元のデータフレームに規模をマージ
     cap_df = cap_df.merge(ranked[['code', '規模']], on='code', how='left')
-    cap_df['規模'] = cap_df['規模'].fillna("小型株") # 時価総額が取れなかったものは一旦小型株扱い
+
+    # ★修正ポイント★
+    # これまでは fillna("小型株") で「取得失敗 = 小型株」に強制していたが、
+    # これだと大型株がAPIエラーで小型株に化けてしまいバグの原因になっていた。
+    # 取得失敗は「分類不可」として明示し、小型株と混ぜない。
+    cap_df['規模'] = cap_df['規模'].fillna("分類不可")
 
     return cap_df[['code', '規模']]
+
 
 def check_ytd_low(code, use_range, min_range_pct):
     try:
@@ -145,11 +191,11 @@ if not df_jpx.empty:
     if '規模' in df_jpx.columns:
         df_jpx = df_jpx.drop(columns=['規模'])
     df_jpx = df_jpx.merge(size_df, left_on='コード_str', right_on='code', how='left')
-    df_jpx['規模'] = df_jpx['規模'].fillna("小型株")
+    df_jpx['規模'] = df_jpx['規模'].fillna("分類不可")
 
     market_options = ["すべて"] + sorted(df_jpx['市場・商品区分'].unique().tolist())
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
-    size_options = ["すべて", "大型株", "中型株", "小型株"]
+    size_options = ["すべて", "大型株", "中型株", "小型株", "分類不可"]
 
 # --- サイドバー：表示モード切り替え ---
 st.sidebar.header("⚙️ 設定")
@@ -162,6 +208,11 @@ mode_label = st.sidebar.radio(
 is_mobile = False if mode_label == "🖥 デスクトップ" else True
 if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.session_state.layout_mode:
     st.session_state.layout_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
+    st.rerun()
+
+# --- サイドバー：キャッシュクリア(時価総額データがおかしいと感じたら使用) ---
+if st.sidebar.button("🔄 時価総額データを再取得する"):
+    load_market_caps.clear()
     st.rerun()
 
 # --- メイン画面：フィルターバー ---
@@ -368,14 +419,15 @@ with tab_screen:
 # タブ2: 全銘柄一覧 ＆ ブラウザAI連携（規模別タブ）
 # ============================================================
 with tab_list:
-    st.markdown("規模区分ごとの全銘柄一覧です。時価総額に基づき正確に「大型株・中型株・小型株」に分類されています。")
+    st.markdown("規模区分ごとの全銘柄一覧です。時価総額に基づき正確に「大型株・中型株・小型株」に分類されています(取得できなかった銘柄は「分類不可」)。")
     st.markdown("---")
 
     if not df_jpx.empty:
-        size_tab_large, size_tab_mid, size_tab_small = st.tabs([
+        size_tab_large, size_tab_mid, size_tab_small, size_tab_unknown = st.tabs([
             f"🔵 大型株（上位100社 / {len(df_jpx[df_jpx['規模'] == '大型株'])}件）",
             f"🟢 中型株（100〜500位 / {len(df_jpx[df_jpx['規模'] == '中型株'])}件）",
             f"⚪ 小型株（500位以降 / {len(df_jpx[df_jpx['規模'] == '小型株'])}件）",
+            f"❓ 分類不可（データ取得失敗 / {len(df_jpx[df_jpx['規模'] == '分類不可'])}件）",
         ])
 
         def render_all_list_with_copy(sub_df):
@@ -412,5 +464,8 @@ with tab_list:
         with size_tab_small:
             st.caption("時価総額500位以降の小型株一覧")
             render_all_list_with_copy(df_jpx[df_jpx['規模'] == '小型株'])
+        with size_tab_unknown:
+            st.caption("時価総額データの取得に失敗した銘柄一覧(再取得ボタンをお試しください)")
+            render_all_list_with_copy(df_jpx[df_jpx['規模'] == '分類不可'])
     else:
         st.info("銘柄データが読み込まれていません。")
