@@ -4,15 +4,22 @@ import pandas as pd
 import requests
 import concurrent.futures
 
-# --- ページ設定（最初から画面を広く使うワイドモードに設定） ---
+# --- 表示モード（デスクトップ／スマホ）をセッションに保持 ---
+if "layout_mode" not in st.session_state:
+    st.session_state.layout_mode = "desktop"
+
+# --- ページ設定（表示モードに応じて横幅を切り替え。必ず最初のst命令にする） ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
     page_icon="📈",
-    layout="wide"
+    layout="wide" if st.session_state.layout_mode == "desktop" else "centered"
 )
 
 # --- 設定 ---
-DISCORD_WEBHOOK_URL = "" 
+try:
+    DISCORD_WEBHOOK_URL = st.secrets["DISCORD_WEBHOOK_URL"]
+except Exception:
+    DISCORD_WEBHOOK_URL = ""
 
 @st.cache_data(ttl=86400)
 def load_jpx_data():
@@ -25,7 +32,6 @@ def load_jpx_data():
         return pd.DataFrame()
 
 def get_market_cap(code):
-    """時価総額を取得（規模区分の判定用）"""
     try:
         ticker = yf.Ticker(f"{code}.T")
         info = ticker.info
@@ -36,7 +42,6 @@ def get_market_cap(code):
 
 @st.cache_data(ttl=86400)
 def load_market_caps(codes):
-    """全銘柄の時価総額を並列取得し、規模区分（大型/中型/小型）を付与して返す"""
     results = []
     progress_text = "時価総額データを取得中（初回は数分かかることがあります）..."
     my_bar = st.progress(0, text=progress_text)
@@ -50,7 +55,6 @@ def load_market_caps(codes):
     my_bar.empty()
 
     cap_df = pd.DataFrame(results)
-    # 時価総額が取得できた銘柄だけを大きい順に並べる
     ranked = cap_df.dropna(subset=['market_cap']).sort_values('market_cap', ascending=False).reset_index(drop=True)
 
     def classify_size(rank):
@@ -63,7 +67,6 @@ def load_market_caps(codes):
 
     ranked['規模'] = [classify_size(i) for i in range(len(ranked))]
 
-    # 時価総額が取得できなかった銘柄は「小型株」扱いにしておく
     cap_df = cap_df.merge(ranked[['code', '規模']], on='code', how='left')
     cap_df['規模'] = cap_df['規模'].fillna("小型株")
 
@@ -107,17 +110,18 @@ def send_discord_notify(msg):
     if DISCORD_WEBHOOK_URL:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
-def make_tradingview_link_df(sub_df):
-    """規模別一覧などで使う、TradingViewリンク付きの表示用データフレームを作る"""
+def make_tradingview_link_df(sub_df, is_mobile):
     display_rows = []
     for _, row in sub_df.iterrows():
         tv_url = f"https://www.tradingview.com/symbols/TSE-{row['コード']}/#{row['銘柄名']}"
-        display_rows.append({
+        entry = {
             "銘柄名": tv_url,
             "コード": row['コード'],
-            "市場": row['市場・商品区分'],
-            "業種": row['33業種区分'],
-        })
+        }
+        if not is_mobile:
+            entry["市場"] = row['市場・商品区分']
+            entry["業種"] = row['33業種区分']
+        display_rows.append(entry)
     return pd.DataFrame(display_rows)
 
 def render_link_table(display_df):
@@ -134,51 +138,61 @@ def render_link_table(display_df):
         hide_index=True
     )
 
-# --- サイドバー（検索条件） ---
+def render_condition(label, number_label, default_check, default_value, is_mobile, key_prefix):
+    """財務条件1行を、PCなら横並び／スマホなら縦積みで描画する"""
+    if is_mobile:
+        use = st.checkbox(label, value=default_check, key=f"{key_prefix}_chk")
+        val = st.number_input(number_label, min_value=0.0, value=default_value, key=f"{key_prefix}_val")
+    else:
+        c1, c2 = st.columns([1, 2])
+        use = c1.checkbox(label, value=default_check, key=f"{key_prefix}_chk")
+        val = c2.number_input(number_label, min_value=0.0, value=default_value, label_visibility="collapsed", key=f"{key_prefix}_val")
+    return use, val
+
+# --- サイドバー：表示モード切り替え ---
 st.sidebar.header("🔍 検索フィルター")
+
+mode_label = st.sidebar.radio(
+    "表示モード",
+    ["🖥 デスクトップ", "📱 スマホ"],
+    index=0 if st.session_state.layout_mode == "desktop" else 1,
+    horizontal=True,
+)
+new_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
+if new_mode != st.session_state.layout_mode:
+    st.session_state.layout_mode = new_mode
+    st.rerun()
+
+is_mobile = st.session_state.layout_mode == "mobile"
+st.sidebar.markdown("---")
 
 df_jpx = load_jpx_data()
 
 if not df_jpx.empty:
-    # 規模区分（大型/中型/小型）をYahoo!ファイナンスの時価総額から算出して付与
     df_jpx['コード_str'] = df_jpx['コード'].astype(str)
     codes_all = tuple(df_jpx['コード_str'].tolist())
     size_df = load_market_caps(codes_all)
     df_jpx = df_jpx.merge(size_df, left_on='コード_str', right_on='code', how='left')
     df_jpx['規模'] = df_jpx['規模'].fillna("小型株")
 
-    st.sidebar.subheader("1. ターゲット設定")
-    markets = ["すべて"] + list(df_jpx['市場・商品区分'].unique())
-    selected_market = st.sidebar.selectbox("市場区分", markets)
-    
-    sectors = ["すべて"] + list(df_jpx['33業種区分'].unique())
-    selected_sector = st.sidebar.selectbox("業種", sectors)
+    market_options = sorted(df_jpx['市場・商品区分'].unique().tolist())
+    sector_options = sorted(df_jpx['33業種区分'].unique().tolist())
+    size_options = ["大型株", "中型株", "小型株"]
 
-    sizes = ["すべて", "大型株", "中型株", "小型株"]
-    selected_size = st.sidebar.selectbox("規模（時価総額ベース）", sizes)
+    with st.sidebar.expander("① 対象銘柄の条件", expanded=True):
+        st.caption("チェックを外すと、その項目は対象から除外されます")
+        selected_markets = st.multiselect("市場区分", market_options, default=market_options)
+        selected_sectors = st.multiselect("業種", sector_options, default=sector_options)
+        selected_sizes = st.multiselect("規模（時価総額ベース）", size_options, default=size_options)
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("2. 価格条件")
-    use_ytd_low = st.sidebar.checkbox("年初来安値を更新している銘柄のみ", value=True)
-    
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("3. 財務フィルター（チェック式）")
-    
-    col_s1, col_s2 = st.sidebar.columns([1, 2])
-    use_per = col_s1.checkbox("PER", value=True)
-    max_per = col_s2.number_input("PER上限(倍)", min_value=0.0, value=15.0, label_visibility="collapsed")
-    
-    col_s3, col_s4 = st.sidebar.columns([1, 2])
-    use_roe = col_s3.checkbox("ROE", value=True)
-    min_roe = col_s4.number_input("ROE下限(%)", min_value=0.0, value=8.0, label_visibility="collapsed")
-    
-    col_s5, col_s6 = st.sidebar.columns([1, 2])
-    use_psr = col_s5.checkbox("PSR", value=False)
-    max_psr = col_s6.number_input("PSR上限(倍)", min_value=0.0, value=5.0, label_visibility="collapsed")
-    
-    col_s7, col_s8 = st.sidebar.columns([1, 2])
-    use_yield = col_s7.checkbox("利回り", value=False)
-    min_yield = col_s8.number_input("利回り下限(%)", min_value=0.0, value=3.0, label_visibility="collapsed")
+    with st.sidebar.expander("② 価格条件", expanded=True):
+        use_ytd_low = st.checkbox("年初来安値を更新している銘柄のみ", value=True)
+
+    with st.sidebar.expander("③ 財務条件", expanded=True):
+        use_per, max_per = render_condition("PER", "PER上限(倍)", True, 15.0, is_mobile, "per")
+        use_roe, min_roe = render_condition("ROE", "ROE下限(%)", True, 8.0, is_mobile, "roe")
+        use_psr, max_psr = render_condition("PSR", "PSR上限(倍)", False, 5.0, is_mobile, "psr")
+        use_yield, min_yield = render_condition("利回り", "利回り下限(%)", False, 3.0, is_mobile, "yield")
     
     st.sidebar.markdown("---")
     search_btn = st.sidebar.button("🚀 スクリーニング開始", type="primary", use_container_width=True)
@@ -189,7 +203,7 @@ st.title("📈 年初来安値 ＆ 財務スクリーニングダッシュボー
 tab_screen, tab_list = st.tabs(["🔍 スクリーニング", "📋 銘柄一覧（規模別）"])
 
 # ============================================================
-# タブ1: スクリーニング（検索ボタンを押して条件抽出）
+# タブ1: スクリーニング
 # ============================================================
 with tab_screen:
     st.markdown("条件に合致するお宝銘柄をリアルタイムで抽出します。銘柄名をクリックするとTradingViewが開きます。")
@@ -197,23 +211,16 @@ with tab_screen:
 
     if search_btn and not df_jpx.empty:
         target_df = df_jpx.copy()
-        if selected_market != "すべて":
-            target_df = target_df[target_df['市場・商品区分'] == selected_market]
-        if selected_sector != "すべて":
-            target_df = target_df[target_df['33業種区分'] == selected_sector]
-        if selected_size != "すべて":
-            target_df = target_df[target_df['規模'] == selected_size]
+        target_df = target_df[target_df['市場・商品区分'].isin(selected_markets)]
+        target_df = target_df[target_df['33業種区分'].isin(selected_sectors)]
+        target_df = target_df[target_df['規模'].isin(selected_sizes)]
             
         codes = target_df['コード'].astype(str).tolist()
-        
-        # ── サマリー表示エリア（メトリクス） ──
-        m1, m2, m3 = st.columns(3)
-        m1.metric(label="第1関門：対象銘柄数", value=f"{len(codes)} 件")
 
         if len(codes) == 0:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。市場・業種・規模の条件を見直してください。")
         else:
-            # --- 年初来安値の条件（チェックが入っている場合のみ実行） ---
+            # --- 年初来安値の条件 ---
             if use_ytd_low:
                 progress_text = "株価データをチェック中..."
                 my_bar = st.progress(0, text=progress_text)
@@ -228,11 +235,19 @@ with tab_screen:
                         my_bar.progress((i + 1) / len(codes), text=f"{progress_text} ({i+1}/{len(codes)})")
                 
                 my_bar.empty()
-                m2.metric(label="第2関門：年初来安値更新", value=f"{len(ytd_low_codes)} 件")
             else:
                 ytd_low_codes = codes
-                m2.metric(label="第2関門：年初来安値条件", value="条件なし（全銘柄通過）")
-            
+
+            # --- ここまでのサマリー表示 ---
+            with st.container(border=True):
+                if is_mobile:
+                    st.metric("① 対象銘柄数", f"{len(codes)} 件")
+                    st.metric("② 年初来安値条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+                else:
+                    c1, c2 = st.columns(2)
+                    c1.metric("① 対象銘柄数", f"{len(codes)} 件")
+                    c2.metric("② 年初来安値条件", f"{len(ytd_low_codes)} 件" if use_ytd_low else "条件なし（全銘柄通過）")
+
             if len(ytd_low_codes) > 0:
                 final_results = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -261,8 +276,8 @@ with tab_screen:
                             
                             final_results.append({
                                 "コード": data['code'],
-                                "銘柄名": tv_url,  # 表示上はURL（display_textで会社名に見せる）
-                                "会社名": company_name,  # Discord通知用に別途保持
+                                "銘柄名": tv_url,
+                                "会社名": company_name,
                                 "市場": row['市場・商品区分'],
                                 "業種": row['33業種区分'],
                                 "規模": row['規模'],
@@ -272,23 +287,29 @@ with tab_screen:
                                 "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
                             })
                 
-                m3.metric(label="最終条件クリア銘柄", value=f"{len(final_results)} 件")
+                st.metric("🏆 最終条件クリア銘柄", f"{len(final_results)} 件")
                 st.markdown("---")
                 
                 if final_results:
                     st.success(f"🎉 条件をクリアしたお宝候補が **{len(final_results)}件** 見つかりました！")
                     result_df = pd.DataFrame(final_results)
+
+                    column_config = {
+                        "銘柄名": st.column_config.LinkColumn(
+                            "銘柄名 (クリックでTradingViewへ)",
+                            help="クリックしてチャート・財務を確認",
+                            display_text=r".*#(.+)"
+                        ),
+                        "会社名": None
+                    }
+                    if is_mobile:
+                        # スマホでは列数を減らして横スクロールを最小限に
+                        column_config["市場"] = None
+                        column_config["業種"] = None
                     
                     st.dataframe(
                         result_df,
-                        column_config={
-                            "銘柄名": st.column_config.LinkColumn(
-                                "銘柄名 (クリックでTradingViewへ)",
-                                help="クリックしてチャート・財務を確認",
-                                display_text=r".*#(.+)"
-                            ),
-                            "会社名": None  # Discord通知用の内部列なので画面には表示しない
-                        },
+                        column_config=column_config,
                         use_container_width=True,
                         hide_index=True
                     )
@@ -299,13 +320,12 @@ with tab_screen:
                 else:
                     st.warning("⚠️ 指定した条件をすべてクリアした銘柄はありませんでした（条件を少し緩めると見つかる場合があります）。")
             else:
-                m3.metric(label="最終条件クリア銘柄", value="0 件")
                 st.warning("⚠️ 選択した市場・業種・規模の中で、条件に合致する銘柄はありませんでした。")
     elif not search_btn:
         st.info("👈 サイドバーで条件を設定して「スクリーニング開始」ボタンを押してください。")
 
 # ============================================================
-# タブ2: 銘柄一覧（規模別） - 検索ボタンなしでいつでも閲覧可能
+# タブ2: 銘柄一覧（規模別）
 # ============================================================
 with tab_list:
     st.markdown("検索条件に関わらず、**規模区分（大型株・中型株・小型株）ごとの全銘柄一覧**をいつでも確認できます。銘柄名をクリックするとTradingViewが開きます。")
@@ -319,12 +339,12 @@ with tab_list:
         ])
 
         with size_tab_large:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '大型株']))
+            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '大型株'], is_mobile))
 
         with size_tab_mid:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '中型株']))
+            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '中型株'], is_mobile))
 
         with size_tab_small:
-            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '小型株']))
+            render_link_table(make_tradingview_link_df(df_jpx[df_jpx['規模'] == '小型株'], is_mobile))
     else:
         st.info("銘柄データが読み込まれていません。data_j.xls を確認してください。")
