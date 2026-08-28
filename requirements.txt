@@ -1,1 +1,5 @@
- streamlit yfinance pandas requests xlrd
+streamlit 
+yfinance 
+pandas
+requests
+xlrd
