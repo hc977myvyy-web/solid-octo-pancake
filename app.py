@@ -186,7 +186,7 @@ if not df_jpx.empty:
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
     size_options = ["すべて", "大型株", "中型株", "小型株"]
 
-# --- サイドバー：表示モードのみに簡素化 ---
+# --- サイドバー：表示モード切り替え ---
 st.sidebar.header("⚙️ 設定")
 mode_label = st.sidebar.radio(
     "表示モード",
@@ -194,17 +194,17 @@ mode_label = st.sidebar.radio(
     index=0 if st.session_state.layout_mode == "desktop" else 1,
     horizontal=True,
 )
-is_mobile = (mode_label != "🖥 デスクトップ") # 簡略判定
+is_mobile = False if mode_label == "🖥 デスクトップ" else True
 if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.session_state.layout_mode:
     st.session_state.layout_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
     st.rerun()
 
-# --- メイン画面：TradingView風 上部フィルターパネル ---
+# --- メイン画面：フィルターバー ---
 st.title("📈 株式スクリーニングダッシュボード")
-st.markdown("TradingView風のパネルから条件を選択し、スクリーニングを実行してください。")
+st.markdown("フィルターバーから条件を設定し、スクリーニングを実行してください。")
 
 with st.container(border=True):
-    st.markdown("##### 🎛️ TradingView風 フィルターバー")
+    st.markdown("##### 🎛️ フィルターバー")
     
     # 1段目：基本セグメント（市場・業種・規模）
     f1, f2, f3 = st.columns(3)
@@ -290,7 +290,6 @@ with tab_screen:
             else:
                 ytd_low_codes = codes
 
-            # サマリーメトリクス
             m1, m2 = st.columns(2)
             m1.metric("① 対象銘柄数", f"{len(codes)} 件")
             m2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件")
@@ -340,11 +339,6 @@ with tab_screen:
                     result_df = pd.DataFrame(final_results)
 
                     column_config = {
-                        "銘柄 name": st.column_config.LinkColumn(
-                            "銘柄名 (クリックでTradingViewへ)",
-                            help="クリックしてチャート・財務を確認",
-                            display_text=r".*#(.+)"
-                        ),
                         "銘柄名": st.column_config.LinkColumn(
                             "銘柄名 (クリックでTradingViewへ)",
                             help="クリックしてチャート・財務を確認",
@@ -368,7 +362,7 @@ with tab_screen:
             else:
                 st.warning("⚠️ 価格条件に合致する銘柄はありませんでした。")
     elif not search_btn:
-        st.info("👆 上部のパネルで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
+        st.info("👆 上部のフィルターバーで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
 
 # ============================================================
 # タブ2: 銘柄一覧（規模別）
