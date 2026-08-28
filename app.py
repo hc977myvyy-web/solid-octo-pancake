@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import requests
 import concurrent.futures
-from openai import OpenAI
 
 # --- セッションステートの初期化 ---
 if "layout_mode" not in st.session_state:
@@ -28,17 +27,11 @@ st.set_page_config(
     layout="wide" if st.session_state.layout_mode == "desktop" else "centered",
 )
 
-# --- 設定 (Discord & OpenAI API) ---
+# --- 設定 (Discord Webhook) ---
 try:
     DISCORD_WEBHOOK_URL = st.secrets["DISCORD_WEBHOOK_URL"]
 except Exception:
     DISCORD_WEBHOOK_URL = ""
-
-try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-except Exception:
-    openai_client = None
 
 @st.cache_data(ttl=86400)
 def load_jpx_data():
@@ -62,9 +55,10 @@ def get_market_cap(code):
 @st.cache_data(ttl=86400)
 def load_market_caps(codes):
     results = []
-    progress_text = "時価総額データを取得中（初回は数分かかることがあります）..."
+    progress_text = "時価総額データを取得中（全銘柄の規模分類を行っています）..."
     my_bar = st.progress(0, text=progress_text)
 
+    # タイムアウトや負荷対策として最大ワーカー数を設定
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(get_market_cap, code): code for code in codes}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
@@ -74,6 +68,7 @@ def load_market_caps(codes):
     my_bar.empty()
 
     cap_df = pd.DataFrame(results)
+    # 時価総額が大きい順にソートしてランキング付け
     ranked = cap_df.dropna(subset=['market_cap']).sort_values('market_cap', ascending=False).reset_index(drop=True)
 
     def classify_size(rank):
@@ -85,8 +80,10 @@ def load_market_caps(codes):
             return "小型株"
 
     ranked['規模'] = [classify_size(i) for i in range(len(ranked))]
+    
+    # 元のデータフレームに規模をマージ
     cap_df = cap_df.merge(ranked[['code', '規模']], on='code', how='left')
-    cap_df['規模'] = cap_df['規模'].fillna("小型株")
+    cap_df['規模'] = cap_df['規模'].fillna("小型株") # 時価総額が取れなかったものは一旦小型株扱い
 
     return cap_df[['code', '規模']]
 
@@ -137,45 +134,16 @@ def send_discord_notify(msg):
     if DISCORD_WEBHOOK_URL:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
-def get_ai_summary(company_name, code, metrics, summary):
-    if not openai_client:
-        return "⚠️ OpenAI APIキーが設定されていません（Streamlit Secretsの 'OPENAI_API_KEY' を確認してください）。"
-    
-    prompt = f"""
-    以下の企業について、個人投資家向けにファンダメンタル分析を簡潔にまとめてください。
-    
-    【企業名】 {company_name} ({code})
-    【事業概要】 {summary}
-    【主要指標】
-    - PER: {metrics.get('PER', '-')}倍
-    - PSR: {metrics.get('PSR', '-')}倍
-    - ROE: {metrics.get('ROE', '-')}%
-    - 配当利回り: {metrics.get('Yield', '-')}%
-    
-    以下の構成で3〜4行程度で極めて簡潔に要約してください：
-    1. **ビジネスの強み**: 
-    2. **現在の評価・割安感**: 
-    3. **注目ポイント**: 
-    """
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "あなたは優秀な日本株のアナリストです。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"ChatGPTによる要約の生成に失敗しました: {e}"
-
-# --- データ読み込み ---
+# --- データ読み込み ＆ 規模分類の適用 ---
 df_jpx = load_jpx_data()
 if not df_jpx.empty:
     df_jpx['コード_str'] = df_jpx['コード'].astype(str)
     codes_all = tuple(df_jpx['コード_str'].tolist())
     size_df = load_market_caps(codes_all)
+    
+    # 既存の規模列があれば削除してマージし直す
+    if '規模' in df_jpx.columns:
+        df_jpx = df_jpx.drop(columns=['規模'])
     df_jpx = df_jpx.merge(size_df, left_on='コード_str', right_on='code', how='left')
     df_jpx['規模'] = df_jpx['規模'].fillna("小型株")
 
@@ -242,7 +210,7 @@ with st.container(border=True):
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
 st.markdown("---")
-tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧 ＆ AI分析"])
+tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧 ＆ ブラウザAI連携"])
 
 # ============================================================
 # タブ1: スクリーニング実行
@@ -355,7 +323,10 @@ with tab_screen:
                         hide_index=True
                     )
                     
-                    st.markdown("### 🤖 抽出銘柄のChatGPTファンダメンタル分析")
+                    # --- 各企業ごとのブラウザAI用コピープロンプトセクション ---
+                    st.markdown("### 📋 ブラウザAI（ChatGPT/Gemini）用プロンプト生成")
+                    st.caption("ボタン（コードブロックの右上）をクリックしてコピーし、無料版のChatGPTやGeminiに貼り付けて分析させてください。")
+                    
                     for res in final_results:
                         with st.container(border=True):
                             c_col1, c_col2 = st.columns([3, 1])
@@ -364,20 +335,24 @@ with tab_screen:
                             
                             st.caption(f"📊 指標 | PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%** | 配当利回り: **{res['配当利回り (%)']}%**")
                             
-                            with st.expander("✨ ChatGPTによるファンダメンタル分析結果を見る"):
-                                with st.spinner(f"{res['会社名']} の分析を生成中..."):
-                                    summary_text = get_ai_summary(
-                                        res['会社名'], 
-                                        res['コード'], 
-                                        {
-                                            'PER': res['PER (倍)'], 
-                                            'PSR': res['PSR (倍)'], 
-                                            'ROE': res['ROE (%)'], 
-                                            'Yield': res['配当利回り (%)']
-                                        }, 
-                                        res['summary']
-                                    )
-                                    st.markdown(summary_text)
+                            # ブラウザAIにそのまま貼り付けられる綺麗なプロンプト文章を生成
+                            prompt_text = f"""以下の日本株企業について、個人投資家向けにファンダメンタル分析を簡潔にまとめてください。
+
+【企業名】 {res['会社名']} ({res['コード']})
+【事業概要】 {res['summary']}
+【主要指標】
+- PER: {res['PER (倍)']}倍
+- PSR: {res['PSR (倍)']}倍
+- ROE: {res['ROE (%)']}%
+- 配当利回り: {res['配当利回り (%)']}%
+
+以下の構成で3〜4行程度で簡潔に要約してください：
+1. **ビジネスの強み**: 
+2. **現在の評価・割安感**: 
+3. **注目ポイント**: """
+
+                            with st.expander("📝 AI用プロンプト（コピー用）を表示"):
+                                st.code(prompt_text, language="markdown")
 
                     for res in final_results:
                         msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\n規模: {res['規模']}\nPER: {res['PER (倍)']} / PSR: {res['PSR (倍)']} / ROE: {res['ROE (%)']}% / 配当利回り: {res['配当利回り (%)']}%"
@@ -390,52 +365,20 @@ with tab_screen:
         st.info("👆 上部のフィルターバーで条件を設定してコードのスクリーニングを実行してください。")
 
 # ============================================================
-# タブ2: 全銘柄一覧 ＆ AI分析（規模別タブ）
+# タブ2: 全銘柄一覧 ＆ ブラウザAI連携（規模別タブ）
 # ============================================================
 with tab_list:
-    st.markdown("規模区分ごとの全銘柄一覧です。気になる企業のコードを入力して個別にChatGPT分析を行うこともできます。")
+    st.markdown("規模区分ごとの全銘柄一覧です。時価総額に基づき正確に「大型株・中型株・小型株」に分類されています。")
     st.markdown("---")
 
     if not df_jpx.empty:
-        with st.container(border=True):
-            st.markdown("##### 🔍 任意銘柄のピンポイントChatGPT分析")
-            search_code_input = st.text_input("銘柄コードを入力してください（例: 4792, 7203）", value="")
-            if search_code_input:
-                target_row = df_jpx[df_jpx['コード'].astype(str) == search_code_input.strip()]
-                if not target_row.empty:
-                    c_name = target_row.iloc[0]['銘柄名']
-                    c_market = target_row.iloc[0]['市場・商品区分']
-                    c_sector = target_row.iloc[0]['33業種区分']
-                    c_size = target_row.iloc[0]['規模']
-                    
-                    st.success(f"**対象企業: {c_name} ({search_code_input})** / 市場: {c_market} / 業種: {c_sector} / 規模: {c_size}")
-                    
-                    with st.spinner("リアルタイムデータを取得してChatGPTが分析中..."):
-                        fund_data = get_fundamentals(search_code_input.strip())
-                        ai_res_text = get_ai_summary(
-                            c_name, 
-                            search_code_input.strip(), 
-                            {
-                                'PER': round(fund_data['PER'], 2) if fund_data['PER'] else '-', 
-                                'PSR': round(fund_data['PSR'], 2) if fund_data['PSR'] else '-', 
-                                'ROE': round(fund_data['ROE'], 2) if fund_data['ROE'] else '-', 
-                                'Yield': round(fund_data['Yield'], 2) if fund_data['Yield'] else '-'
-                            }, 
-                            fund_data['summary']
-                        )
-                        st.markdown(ai_res_text)
-                else:
-                    st.error("該当する銘柄コードが見つかりませんでした。")
-
-        st.markdown("---")
-        
         size_tab_large, size_tab_mid, size_tab_small = st.tabs([
-            f"🔵 大型株（{len(df_jpx[df_jpx['規模'] == '大型株'])}件）",
-            f"🟢 中型株（{len(df_jpx[df_jpx['規模'] == '中型株'])}件）",
-            f"⚪ 小型株（{len(df_jpx[df_jpx['規模'] == '小型株'])}件）",
+            f"🔵 大型株（上位100社 / {len(df_jpx[df_jpx['規模'] == '大型株'])}件）",
+            f"🟢 中型株（100〜500位 / {len(df_jpx[df_jpx['規模'] == '中型株'])}件）",
+            f"⚪ 小型株（500位以降 / {len(df_jpx[df_jpx['規模'] == '小型株'])}件）",
         ])
 
-        def render_all_list_with_ai(sub_df):
+        def render_all_list_with_copy(sub_df):
             for _, row in sub_df.iterrows():
                 code = row['コード']
                 name = row['銘柄名']
@@ -443,32 +386,31 @@ with tab_list:
                 
                 with st.container(border=True):
                     col_a, col_b = st.columns([3, 1])
-                    col_a.markdown(f"**[{name}]({tv_url})** （コード: `{code}`） / 業種: {row['33業種区分']}")
+                    col_a.markdown(f"**[{name}]({tv_url})** （コード: `{code}`） / 市場: {row['市場・商品区分']} / 業種: {row['33業種区分']}")
                     
-                    with st.expander("🤖 この企業のChatGPT分析を見る"):
-                        with st.spinner("ChatGPTが分析を生成中..."):
+                    with st.expander("📝 ブラウザAI用プロンプトをコピーする"):
+                        with st.spinner("企業データを取得中..."):
                             f_data = get_fundamentals(str(code))
-                            res_text = get_ai_summary(
-                                name, 
-                                str(code), 
-                                {
-                                    'PER': round(f_data['PER'], 2) if f_data['PER'] else '-', 
-                                    'PSR': round(f_data['PSR'], 2) if f_data['PSR'] else '-', 
-                                    'ROE': round(f_data['ROE'], 2) if f_data['ROE'] else '-', 
-                                    'Yield': round(f_data['Yield'], 2) if f_data['Yield'] else '-'
-                                }, 
-                                f_data['summary']
-                            )
-                            st.markdown(res_text)
+                            p_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
+【企業名】 {name} ({code})
+【事業概要】 {f_data['summary']}
+【主要指標】
+- PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍
+- PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍
+- ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%
+- 配当利回り: {round(f_data['Yield'], 2) if f_data['Yield'] else '-'}%
+
+強み、割安感、注目ポイントを3行程度で要約してください。"""
+                            st.code(p_text, language="markdown")
 
         with size_tab_large:
-            st.caption("大型株の一覧と各企業のChatGPT分析")
-            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '大型株'])
+            st.caption("時価総額上位約100社の大型株一覧")
+            render_all_list_with_copy(df_jpx[df_jpx['規模'] == '大型株'])
         with size_tab_mid:
-            st.caption("中型株の一覧と各企業のChatGPT分析")
-            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '中型株'])
+            st.caption("時価総額100位〜500位の中型株一覧")
+            render_all_list_with_copy(df_jpx[df_jpx['規模'] == '中型株'])
         with size_tab_small:
-            st.caption("小型株の一覧と各企業のChatGPT分析")
-            render_all_list_with_ai(df_jpx[df_jpx['規模'] == '小型株'])
+            st.caption("時価総額500位以降の小型株一覧")
+            render_all_list_with_copy(df_jpx[df_jpx['規模'] == '小型株'])
     else:
         st.info("銘柄データが読み込まれていません。")
