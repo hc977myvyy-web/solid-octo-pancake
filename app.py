@@ -157,24 +157,41 @@ def check_ytd_low(code, use_range, min_range_pct):
         pass
     return None
 
-def get_fundamentals(code):
-    try:
-        ticker = yf.Ticker(f"{code}.T")
-        info = ticker.info
-        per = info.get('trailingPE') or info.get('forwardPE')
-        roe = info.get('returnOnEquity')
-        psr = info.get('priceToSalesTrailing12Months')
-        dividend_yield = info.get('dividendYield')
-        summary = info.get('longBusinessSummary', '事業概要の記載なし')
-        
-        if roe is not None:
-            roe = roe * 100 
-        if dividend_yield is not None:
-            dividend_yield = dividend_yield * 100
-            
-        return {'code': code, 'PER': per, 'ROE': roe, 'PSR': psr, 'Yield': dividend_yield, 'summary': summary}
-    except:
-        return {'code': code, 'PER': None, 'ROE': None, 'PSR': None, 'Yield': None, 'summary': ''}
+def get_fundamentals(code, max_retries=2):
+    """
+    財務指標(PER/ROE/PSR/配当利回り)を取得する。
+    - 一時的な失敗はリトライで拾う
+    - 何が原因で取得できなかったかを error として保持する(握りつぶさない)
+    - 1項目でも取れていれば結果として採用する(全部空になるのを防ぐ)
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            ticker = yf.Ticker(f"{code}.T")
+            info = ticker.info
+            per = info.get('trailingPE') or info.get('forwardPE')
+            roe = info.get('returnOnEquity')
+            psr = info.get('priceToSalesTrailing12Months')
+            dividend_yield = info.get('dividendYield')
+            summary = info.get('longBusinessSummary', '事業概要の記載なし')
+
+            if roe is not None:
+                roe = roe * 100
+            if dividend_yield is not None:
+                dividend_yield = dividend_yield * 100
+
+            if any(v is not None for v in [per, roe, psr, dividend_yield]):
+                return {'code': code, 'PER': per, 'ROE': roe, 'PSR': psr,
+                        'Yield': dividend_yield, 'summary': summary, 'error': None}
+            last_error = "指標がすべて空でした"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < max_retries:
+            time.sleep(0.5 * (attempt + 1))  # 少し待ってリトライ(レート制限対策)
+
+    return {'code': code, 'PER': None, 'ROE': None, 'PSR': None,
+            'Yield': None, 'summary': '', 'error': last_error}
 
 def send_discord_notify(msg):
     if DISCORD_WEBHOOK_URL:
@@ -312,11 +329,14 @@ with tab_screen:
 
             if len(ytd_low_codes) > 0:
                 final_results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                fundamentals_fail_count = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     futures = {executor.submit(get_fundamentals, code): code for code in ytd_low_codes}
                     for future in concurrent.futures.as_completed(futures):
                         data = future.result()
-                        
+                        if data.get('error'):
+                            fundamentals_fail_count += 1
+
                         per_ok = True
                         psr_ok = True
                         roe_ok = True
@@ -353,6 +373,13 @@ with tab_screen:
                             })
                 
                 st.markdown("---")
+                if fundamentals_fail_count > 0:
+                    st.warning(
+                        f"⚠️ 財務指標(PER/ROE/PSR/配当利回り)の取得に失敗した銘柄が "
+                        f"{fundamentals_fail_count} 件ありました。"
+                        "これらは財務条件フィルターで自動的に除外されています。"
+                        "件数が多い場合は少し時間を置いて再実行してみてください。"
+                    )
                 if final_results:
                     st.success(f"🎉 条件をクリアしたお宝候補が **{len(final_results)}件** 見つかりました！")
                     result_df = pd.DataFrame(final_results)
