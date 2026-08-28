@@ -1,0 +1,1 @@
+ streamlit yfinance pandas requests xlrd
