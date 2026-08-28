@@ -12,8 +12,6 @@ if "market_filter" not in st.session_state:
     st.session_state.market_filter = "すべて"
 if "sector_filter" not in st.session_state:
     st.session_state.sector_filter = "すべて"
-if "size_filter" not in st.session_state:
-    st.session_state.size_filter = "すべて"
 if "use_ytd" not in st.session_state:
     st.session_state.use_ytd = True
 if "use_range" not in st.session_state:
@@ -39,7 +37,6 @@ def load_jpx_data():
     try:
         df = pd.read_excel("data_j.xls")
         df = df[df['市場・商品区分'].notna()]
-        # デフォルトで全銘柄の規模を一旦「一般銘柄」として安全に保持
         df['規模'] = "一般銘柄"
         return df
     except Exception as e:
@@ -75,21 +72,32 @@ def get_fundamentals(code, max_retries=1):
     for attempt in range(max_retries + 1):
         try:
             ticker = yf.Ticker(f"{code}.T")
-            
-            # 高速化のため fast_info を優先
-            cap = None
-            try:
-                cap = ticker.fast_info.get("market_cap")
-            except:
-                pass
-
             info = ticker.info
-            if not cap:
-                cap = info.get('marketCap')
+            
+            # リアルタイム現在値の取得（複数のキーをフォールバック）
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+            if not current_price:
+                # 履歴の最新終値からフォールバック取得
+                hist = ticker.history(period="5d")
+                if not hist.empty:
+                    current_price = hist['Close'].iloc[-1]
 
+            # PERの取得（直値がなければ 自前で株価 ÷ EPS から計算）
             per = info.get('trailingPE') or info.get('forwardPE')
-            roe = info.get('returnOnEquity')
+            if not per and current_price:
+                eps = info.get('trailingEps') or info.get('forwardEps')
+                if eps and eps > 0:
+                    per = current_price / eps
+
+            # PSRの取得（直値がなければ 時価総額 ÷ 年間売上高 から計算）
             psr = info.get('priceToSalesTrailing12Months')
+            if not psr and current_price:
+                market_cap = info.get('marketCap')
+                revenue = info.get('totalRevenue')
+                if market_cap and revenue and revenue > 0:
+                    psr = market_cap / revenue
+
+            roe = info.get('returnOnEquity')
             dividend_yield = info.get('dividendYield')
             summary = info.get('longBusinessSummary', '事業概要の記載なし')
 
@@ -100,7 +108,6 @@ def get_fundamentals(code, max_retries=1):
 
             return {
                 'code': code, 
-                'market_cap': cap,
                 'PER': per, 
                 'ROE': roe, 
                 'PSR': psr,
@@ -115,7 +122,7 @@ def get_fundamentals(code, max_retries=1):
             time.sleep(0.3)
 
     return {
-        'code': code, 'market_cap': None, 'PER': None, 'ROE': None, 
+        'code': code, 'PER': None, 'ROE': None, 
         'PSR': None, 'Yield': None, 'summary': '', 'error': last_error
     }
 
@@ -129,7 +136,6 @@ if not df_jpx.empty:
     df_jpx['コード_str'] = df_jpx['コード'].astype(str)
     market_options = ["すべて"] + sorted(df_jpx['市場・商品区分'].unique().tolist())
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
-    size_options = ["すべて", "一般銘柄"]
 
 # --- サイドバー：表示モード切り替え ---
 st.sidebar.header("⚙️ 設定")
@@ -146,18 +152,16 @@ if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.se
 
 # --- メイン画面：フィルターバー ---
 st.title("📈 株式スクリーニングダッシュボード")
-st.markdown("フィルターバーから条件を設定し、スクリーニングを実行してください。（高速・安定版）")
+st.markdown("フィルターバーから条件を設定し、スクリーニングを実行してください。")
 
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
     
-    f1, f2, f3 = st.columns(3)
+    f1, f2 = st.columns(2)
     with f1:
         st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
     with f2:
         st.session_state.sector_filter = st.selectbox("業種", sector_options, index=sector_options.index(st.session_state.sector_filter) if st.session_state.sector_filter in sector_options else 0)
-    with f3:
-        st.session_state.size_filter = st.selectbox("規模", size_options, index=0)
 
     st.markdown("---")
     
@@ -186,7 +190,6 @@ with st.container(border=True):
         use_yield = st.checkbox("配当利回り制限", value=False)
         min_yield = st.number_input("利回り下限(%)", min_value=0.0, value=3.0, step=1.0)
 
-    st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
 st.markdown("---")
@@ -210,7 +213,7 @@ with tab_screen:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。")
         else:
             if st.session_state.use_ytd:
-                progress_text = "株価データ＆条件を解析中..."
+                progress_text = "リアルタイム株価データを解析中..."
                 my_bar = st.progress(0, text=progress_text)
                 ytd_low_codes = []
 
@@ -301,8 +304,6 @@ with tab_screen:
                     )
                     
                     st.markdown("### 📋 ブラウザAI（ChatGPT/Gemini）用プロンプト生成")
-                    st.caption("ボタンをクリックしてコピーし、無料版のChatGPTやGeminiに貼り付けて分析させてください。")
-                    
                     for res in final_results:
                         with st.container(border=True):
                             st.markdown(f"#### 🏢 {res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
@@ -325,10 +326,6 @@ with tab_screen:
 
                             with st.expander("📝 AI用プロンプト（コピー用）を表示"):
                                 st.code(prompt_text, language="markdown")
-
-                    for res in final_results:
-                        msg = f"【安値更新＆条件クリア】\n{res['会社名']} ({res['コード']})\nPER: {res['PER (倍)']} / ROE: {res['ROE (%)']}%"
-                        send_discord_notify(msg)
                 else:
                     st.warning("⚠️ 指定した財務制限をすべてクリアした銘柄はありませんでした。")
             else:
@@ -340,7 +337,7 @@ with tab_screen:
 # タブ2: 全銘柄一覧 ＆ ブラウザAI連携
 # ============================================================
 with tab_list:
-    st.markdown("全銘柄の一覧です。気になる銘柄のコードを入力するか、リストから確認してください。")
+    st.markdown("全銘柄の一覧です。銘柄コードを入力すると、リアルタイムの株価と計算された財務指標を取得できます。")
     st.markdown("---")
 
     if not df_jpx.empty:
@@ -354,8 +351,10 @@ with tab_list:
                 
                 with st.container(border=True):
                     st.markdown(f"**[{c_name}]({tv_url})** （コード: `{code}`）")
-                    with st.spinner("データを取得中..."):
+                    with st.spinner("リアルタイムデータを取得・計算中..."):
                         f_data = get_fundamentals(code)
+                        st.caption(f"PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍 / PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍 / ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%")
+                        
                         p_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
 【企業名】 {c_name} ({code})
 【事業概要】 {f_data['summary']}
