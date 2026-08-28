@@ -37,10 +37,9 @@ def load_jpx_data():
     try:
         df = pd.read_excel("data_j.xls")
         df = df[df['市場・商品区分'].notna()]
-        df['規模'] = "一般銘柄"
         return df
     except Exception as e:
-        st.error(f"銘柄データの取得に失敗しました: {e}")
+        st.error(f"銘柄データの取得に失敗しました: data_j.xls ファイルを確認してください: {e}")
         return pd.DataFrame()
 
 def check_ytd_low(code, use_range, min_range_pct):
@@ -74,22 +73,18 @@ def get_fundamentals(code, max_retries=1):
             ticker = yf.Ticker(f"{code}.T")
             info = ticker.info
             
-            # リアルタイム現在値の取得（複数のキーをフォールバック）
             current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
             if not current_price:
-                # 履歴の最新終値からフォールバック取得
                 hist = ticker.history(period="5d")
                 if not hist.empty:
                     current_price = hist['Close'].iloc[-1]
 
-            # PERの取得（直値がなければ 自前で株価 ÷ EPS から計算）
             per = info.get('trailingPE') or info.get('forwardPE')
             if not per and current_price:
                 eps = info.get('trailingEps') or info.get('forwardEps')
                 if eps and eps > 0:
                     per = current_price / eps
 
-            # PSRの取得（直値がなければ 時価総額 ÷ 年間売上高 から計算）
             psr = info.get('priceToSalesTrailing12Months')
             if not psr and current_price:
                 market_cap = info.get('marketCap')
@@ -98,20 +93,16 @@ def get_fundamentals(code, max_retries=1):
                     psr = market_cap / revenue
 
             roe = info.get('returnOnEquity')
-            dividend_yield = info.get('dividendYield')
-            summary = info.get('longBusinessSummary', '事業概要の記載なし')
-
             if roe is not None:
                 roe = roe * 100
-            if dividend_yield is not None:
-                dividend_yield = dividend_yield * 100
+
+            summary = info.get('longBusinessSummary', '事業概要の記載なし')
 
             return {
                 'code': code, 
                 'PER': per, 
                 'ROE': roe, 
-                'PSR': psr,
-                'Yield': dividend_yield, 
+                'PSR': psr, 
                 'summary': summary, 
                 'error': None
             }
@@ -123,7 +114,7 @@ def get_fundamentals(code, max_retries=1):
 
     return {
         'code': code, 'PER': None, 'ROE': None, 
-        'PSR': None, 'Yield': None, 'summary': '', 'error': last_error
+        'PSR': None, 'summary': '', 'error': last_error
     }
 
 def send_discord_notify(msg):
@@ -152,11 +143,12 @@ if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.se
 
 # --- メイン画面：フィルターバー ---
 st.title("📈 株式スクリーニングダッシュボード")
-st.markdown("フィルターバーから条件を設定し、スクリーニングを実行してください。")
+st.markdown("条件を設定してスクリーニングを実行するか、全銘柄一覧タブをご確認ください。")
 
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
     
+    # 1. 業種・市場区分フィルター
     f1, f2 = st.columns(2)
     with f1:
         st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
@@ -165,38 +157,38 @@ with st.container(border=True):
 
     st.markdown("---")
     
+    # 2. 年初来安値・値動き率（レンジ）フィルター
     p1, p2, p3 = st.columns([1.2, 1, 1.8])
     with p1:
         st.session_state.use_ytd = st.checkbox("年初来安値更新", value=st.session_state.use_ytd)
     with p2:
-        st.session_state.use_range = st.checkbox("レンジ下限絞り", value=st.session_state.use_range)
+        st.session_state.use_range = st.checkbox("値動き率（レンジ）", value=st.session_state.use_range)
     with p3:
-        st.session_state.min_range = st.number_input("レンジ下限(%)", min_value=0.0, value=st.session_state.min_range, step=1.0)
+        st.session_state.min_range = st.number_input("最低レンジ幅 (%)", min_value=0.0, value=st.session_state.min_range, step=1.0, help="年初来の高値・安値の変動幅がこの割合以上の銘柄に絞ります")
 
     st.markdown("---")
 
-    st.markdown("###### 💰 財務条件フィルター（制限をかけたい項目にチェックを入れてください）")
-    t1, t2, t3, t4 = st.columns(4)
+    # 3. 財務条件フィルター（PER、PSR、ROE）
+    st.markdown("###### 💰 財務条件フィルター（制限をかけたい項目にチェック）")
+    t1, t2, t3 = st.columns(3)
     with t1:
         use_per = st.checkbox("PER制限", value=True)
-        max_per = st.number_input("PER上限(倍)", min_value=0.0, value=15.0, step=1.0)
+        max_per = st.number_input("PER上限 (倍)", min_value=0.0, value=15.0, step=1.0)
     with t2:
         use_psr = st.checkbox("PSR制限", value=False)
-        max_psr = st.number_input("PSR上限(倍)", min_value=0.0, value=5.0, step=1.0)
+        max_psr = st.number_input("PSR上限 (倍)", min_value=0.0, value=5.0, step=1.0)
     with t3:
         use_roe = st.checkbox("ROE制限", value=True)
-        min_roe = st.number_input("ROE下限(%)", min_value=0.0, value=8.0, step=1.0)
-    with t4:
-        use_yield = st.checkbox("配当利回り制限", value=False)
-        min_yield = st.number_input("利回り下限(%)", min_value=0.0, value=3.0, step=1.0)
+        min_roe = st.number_input("ROE下限 (%)", min_value=0.0, value=8.0, step=1.0)
 
+    st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
 st.markdown("---")
-tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧 ＆ ブラウザAI連携"])
+tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧"])
 
 # ============================================================
-# タブ1: スクリーニング実行
+# タブ1: スクリーニング結果
 # ============================================================
 with tab_screen:
     if search_btn and not df_jpx.empty:
@@ -213,7 +205,7 @@ with tab_screen:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。")
         else:
             if st.session_state.use_ytd:
-                progress_text = "リアルタイム株価データを解析中..."
+                progress_text = "年初来安値＆値動き率を解析中..."
                 my_bar = st.progress(0, text=progress_text)
                 ytd_low_codes = []
 
@@ -238,7 +230,7 @@ with tab_screen:
 
             m1, m2 = st.columns(2)
             m1.metric("① 対象銘柄数", f"{len(codes)} 件")
-            m2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件")
+            m2.metric("② 条件クリア", f"{len(ytd_low_codes)} 件")
 
             if len(ytd_low_codes) > 0:
                 final_results = []
@@ -250,7 +242,6 @@ with tab_screen:
                         per_ok = True
                         psr_ok = True
                         roe_ok = True
-                        yield_ok = True
                         
                         if use_per:
                             per_ok = (data['PER'] is not None) and (data['PER'] <= max_per)
@@ -258,10 +249,8 @@ with tab_screen:
                             psr_ok = (data['PSR'] is not None) and (data['PSR'] <= max_psr)
                         if use_roe:
                             roe_ok = (data['ROE'] is not None) and (data['ROE'] >= min_roe)
-                        if use_yield:
-                            yield_ok = (data['Yield'] is not None) and (data['Yield'] >= min_yield)
                             
-                        if per_ok and psr_ok and roe_ok and yield_ok:
+                        if per_ok and psr_ok and roe_ok:
                             row = target_df[target_df['コード'].astype(str) == data['code']].iloc[0]
                             company_name = row['銘柄名']
                             code = data['code']
@@ -277,18 +266,17 @@ with tab_screen:
                                 "PER (倍)": round(data['PER'], 2) if data['PER'] else "-",
                                 "PSR (倍)": round(data['PSR'], 2) if data['PSR'] else "-",
                                 "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
-                                "配当利回り (%)": round(data['Yield'], 2) if data['Yield'] else "-",
                                 "summary": data['summary']
                             })
                 
                 st.markdown("---")
                 if final_results:
-                    st.success(f"🎉 条件をクリアしたお宝候補が **{len(final_results)}件** 見つかりました！")
+                    st.success(f"🎉 条件をクリアした銘柄が **{len(final_results)}件** 見つかりました！")
                     result_df = pd.DataFrame(final_results)
 
                     column_config = {
                         "銘柄名": st.column_config.LinkColumn(
-                            "銘柄名 (クリックでTradingView/アプリへ)",
+                            "銘柄名 (クリックでTradingViewへ)",
                             help="クリックしてチャートを確認",
                             display_text=r".*#(.+)"
                         ),
@@ -303,41 +291,37 @@ with tab_screen:
                         hide_index=True
                     )
                     
-                    st.markdown("### 📋 ブラウザAI（ChatGPT/Gemini）用プロンプト生成")
+                    # ブラウザAI用プロンプト生成
+                    st.markdown("### 📋 ブラウザAI用プロンプト生成")
                     for res in final_results:
                         with st.container(border=True):
-                            st.markdown(f"#### 🏢 {res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
-                            st.caption(f"📊 指標 | PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%** | 配当利回り: **{res['配当利回り (%)']}%**")
+                            st.markdown(f"#### 🏢 {res['会社Name'] if '会社Name' in res else res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
+                            st.caption(f"📊 PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%**")
                             
-                            prompt_text = f"""以下の日本株企業について、個人投資家向けにファンダメンタル分析を簡潔にまとめてください。
-
+                            prompt_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
 【企業名】 {res['会社名']} ({res['コード']})
 【事業概要】 {res['summary']}
-【主要指標】
-- PER: {res['PER (倍)']}倍
-- PSR: {res['PSR (倍)']}倍
-- ROE: {res['ROE (%)']}%
-- 配当利回り: {res['配当利回り (%)']}%
+【主要指標】 PER: {res['PER (倍)']}倍 / PSR: {res['PSR (倍)']}倍 / ROE: {res['ROE (%)']}%
+強み、割安感、注目ポイントを3行程度で要約してください。"""
 
-以下の構成で3〜4行程度で簡潔に要約してください：
-1. **ビジネスの強み**: 
-2. **現在の評価・割安感**: 
-3. **注目ポイント**: """
-
-                            with st.expander("📝 AI用プロンプト（コピー用）を表示"):
+                            with st.expander("📝 AI用プロンプト（コピー用）"):
                                 st.code(prompt_text, language="markdown")
+
+                    for res in final_results:
+                        msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\nPER: {res['PER (倍)']} / ROE: {res['ROE (%)']}%"
+                        send_discord_notify(msg)
                 else:
-                    st.warning("⚠️ 指定した財務制限をすべてクリアした銘柄はありませんでした。")
+                    st.warning("⚠️ 指定した財務条件をクリアした銘柄はありませんでした。")
             else:
-                st.warning("⚠️ 価格条件に合致する銘柄はありませんでした。")
+                st.warning("⚠️ 年初来安値・値動き率の条件に合致する銘柄はありませんでした。")
     elif not search_btn:
-        st.info("👆 上部のフィルターバーで条件を設定してコードのスクリーニングを実行してください。")
+        st.info("👆 上部のフィルターバーで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
 
 # ============================================================
-# タブ2: 全銘柄一覧 ＆ ブラウザAI連携
+# タブ2: 全銘柄一覧
 # ============================================================
 with tab_list:
-    st.markdown("全銘柄の一覧です。銘柄コードを入力すると、リアルタイムの株価と計算された財務指標を取得できます。")
+    st.markdown("全銘柄の一覧です。気になるコードを入力するか、リストから確認してください。")
     st.markdown("---")
 
     if not df_jpx.empty:
@@ -351,19 +335,14 @@ with tab_list:
                 
                 with st.container(border=True):
                     st.markdown(f"**[{c_name}]({tv_url})** （コード: `{code}`）")
-                    with st.spinner("リアルタイムデータを取得・計算中..."):
+                    with st.spinner("財務指標を取得中..."):
                         f_data = get_fundamentals(code)
                         st.caption(f"PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍 / PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍 / ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%")
                         
                         p_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
 【企業名】 {c_name} ({code})
 【事業概要】 {f_data['summary']}
-【主要指標】
-- PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍
-- PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍
-- ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%
-- 配当利回り: {round(f_data['Yield'], 2) if f_data['Yield'] else '-'}%
-
+【主要指標】 PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍 / PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍 / ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%
 強み、割安感、注目ポイントを3行程度で要約してください。"""
                         st.code(p_text, language="markdown")
             else:
@@ -376,6 +355,6 @@ with tab_list:
             code = row['コード']
             name = row['銘柄名']
             tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{name}"
-            st.markdown(f"- **[{name}]({tv_url})** (`{code}`) - {row['33業種区分']}")
+            st.markdown(f"- **[{name}]({tv_url})** (`{code}`) - 市場: {row['市場・商品区分']} / 業種: {row['33業種区分']}")
     else:
         st.info("銘柄データが読み込まれていません。")
