@@ -2,29 +2,21 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 import concurrent.futures
-import time
 
 # --- セッションステートの初期化 ---
-if "layout_mode" not in st.session_state:
-    st.session_state.layout_mode = "desktop"
 if "market_filter" not in st.session_state:
     st.session_state.market_filter = "すべて"
 if "sector_filter" not in st.session_state:
     st.session_state.sector_filter = "すべて"
-if "use_ytd" not in st.session_state:
-    st.session_state.use_ytd = True
-if "use_range" not in st.session_state:
-    st.session_state.use_range = True
-if "min_range" not in st.session_state:
-    st.session_state.min_range = 15.0
+if "min_avg_volume" not in st.session_state:
+    st.session_state.min_avg_volume = 10000
 
 # --- ページ設定 ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
     page_icon="📈",
-    layout="wide" if st.session_state.layout_mode == "desktop" else "centered",
+    layout="wide",
 )
 
 # --- 設定 (Discord Webhook) ---
@@ -32,6 +24,7 @@ try:
     DISCORD_WEBHOOK_URL = st.secrets["DISCORD_WEBHOOK_URL"]
 except Exception:
     DISCORD_WEBHOOK_URL = ""
+
 
 @st.cache_data(ttl=86400)
 def load_jpx_data():
@@ -43,134 +36,37 @@ def load_jpx_data():
         st.error(f"銘柄データの取得に失敗しました: data_j.xls ファイルを確認してください: {e}")
         return pd.DataFrame()
 
-# --- かぶたんからのスクレイピングによる財務指標補完 ---
-def scrape_kabutan(code):
+
+def check_avg_volume(code, min_avg_volume, lookback_days=20):
     """
-    かぶたん(kabutan.jp)からPER, PSR, ROE, 事業概要をスクレイピングして取得する
+    直近 lookback_days 営業日の平均出来高が min_avg_volume 以上かどうかを判定する。
+    条件を満たせば (code, avg_volume) を返し、満たさなければ None を返す。
+
+    ※ 現在は yfinance を利用。J-Quants API に切り替える場合は、
+      この関数の中身を J-Quants の /prices/daily_quotes (または
+      v2の /equities/bars/daily) から出来高を取得する処理に差し替える。
     """
-    per, psr, roe = None, None, None
-    summary = "事業概要の記載なし"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    try:
-        # 1. 銘柄トップページ (PER, ROE等の基本指標)
-        url_top = f"https://kabutan.jp/stock/?code={code}"
-        res = requests.get(url_top, headers=headers, timeout=4)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
-            # かぶたんのテーブル・株価ビューから数値を抽出
-            # 例: PER(倍), PBR, 配当利回り, 自社株等のブロックを走査
-            tables = soup.select("table.stock_table, table.dash_table")
-            for table in tables:
-                text = table.get_text()
-                if "ＰＥＲ" in text or "PER" in text:
-                    # 表の中のセルを探索
-                    rows = table.find_all("tr")
-                    for row in rows:
-                        cols = row.find_all(["th", "td"])
-                        for i, col in enumerate(cols):
-                            col_text = col.get_text().strip()
-                            if col_text in ["ＰＥＲ(連)", "ＰＥＲ", "PER（連）"] and i + 1 < len(cols):
-                                val_str = cols[i+1].get_text().replace("倍", "").replace(",", "").strip()
-                                try:
-                                    per = float(val_str)
-                                except:
-                                    pass
-                            if col_text in ["ＲＯＥ(連)", "ROE", "ROE（連）"] and i + 1 < len(cols):
-                                val_str = cols[i+1].get_text().replace("%", "").replace(",", "").strip()
-                                try:
-                                    roe = float(val_str)
-                                except:
-                                    pass
-
-        # 2. 財務・決算ページ等から補完を試みる
-        url_finance = f"https://kabutan.jp/stock/finance?code={code}"
-        res_fin = requests.get(url_finance, headers=headers, timeout=4)
-        if res_fin.status_code == 200:
-            soup_fin = BeautifulSoup(res_fin.text, 'html.parser')
-            # 事業概要などのテキストがあれば取得
-            summary_elem = soup_fin.select_one(".company_profile, .profile_text, p.summary")
-            if summary_elem:
-                summary = summary_elem.get_text().strip()
-
-    except Exception:
-        pass
-
-    return per, psr, roe, summary
-
-def check_ytd_low(code, use_range, min_range_pct):
     try:
         ticker = yf.Ticker(f"{code}.T")
-        hist = ticker.history(period="ytd")
-        if len(hist) < 2:
+        # 土日祝日や欠損を考慮し、少し多めに1ヶ月分を取得してから直近N日分を使う
+        hist = ticker.history(period="1mo")
+        if len(hist) < lookback_days:
             return None
 
-        ytd_low = hist['Low'].min()
-        ytd_high = hist['High'].max()
-        latest_low = hist['Low'].iloc[-1]
+        recent = hist['Volume'].tail(lookback_days)
+        avg_volume = recent.mean()
 
-        if use_range and min_range_pct > 0:
-            if ytd_low <= 0:
-                return None
-            range_pct = (ytd_high - ytd_low) / ytd_low * 100
-            if range_pct < min_range_pct:
-                return None
-
-        if latest_low <= ytd_low:
-            return code
-    except:
+        if avg_volume >= min_avg_volume:
+            return (code, avg_volume)
+    except Exception:
         pass
     return None
 
-def get_fundamentals(code):
-    per, psr, roe = None, None, None
-    summary = "事業概要の記載なし"
-
-    # まず yfinance から取得を試みる
-    try:
-        ticker = yf.Ticker(f"{code}.T")
-        info = ticker.info
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-        
-        per = info.get('trailingPE') or info.get('forwardPE')
-        if not per and current_price:
-            eps = info.get('trailingEps') or info.get('forwardEps')
-            if eps and eps > 0:
-                per = current_price / eps
-
-        psr = info.get('priceToSalesTrailing12Months')
-        roe = info.get('returnOnEquity')
-        if roe is not None:
-            roe = roe * 100
-
-        summary = info.get('longBusinessSummary', '事業概要の記載なし')
-    except:
-        pass
-
-    # 足りない指標（PERやROE）がある場合は「かぶたん」のスクレイピングで補完
-    if per is None or roe is None:
-        kb_per, kb_psr, kb_roe, kb_summary = scrape_kabutan(code)
-        if per is None and kb_per is not None:
-            per = kb_per
-        if roe is None and kb_roe is not None:
-            roe = kb_roe
-        if psr is None and kb_psr is not None:
-            psr = kb_psr
-        if summary == "事業概要の記載なし" and kb_summary != "事業概要の記載なし":
-            summary = kb_summary
-
-    return {
-        'code': code, 
-        'PER': per, 
-        'ROE': roe, 
-        'PSR': psr, 
-        'summary': summary
-    }
 
 def send_discord_notify(msg):
     if DISCORD_WEBHOOK_URL:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+
 
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
@@ -179,64 +75,51 @@ if not df_jpx.empty:
     market_options = ["すべて"] + sorted(df_jpx['市場・商品区分'].unique().tolist())
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
 
-# --- サイドバー：表示モード切り替え ---
-st.sidebar.header("⚙️ 設定")
-mode_label = st.sidebar.radio(
-    "表示モード",
-    ["🖥 デスクトップ", "📱 スマホ"],
-    index=0 if st.session_state.layout_mode == "desktop" else 1,
-    horizontal=True,
-)
-is_mobile = False if mode_label == "🖥 デスクトップ" else True
-if ("desktop" if mode_label == "🖥 デスクトップ" else "mobile") != st.session_state.layout_mode:
-    st.session_state.layout_mode = "desktop" if mode_label == "🖥 デスクトップ" else "mobile"
-    st.rerun()
-
 # --- メイン画面：フィルターバー ---
 st.title("📈 株式スクリーニングダッシュボード")
 st.markdown("条件を設定してスクリーニングを実行するか、全銘柄一覧タブをご確認ください。")
 
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
-    
+
     # 1. 業種・市場区分フィルター
     f1, f2 = st.columns(2)
     with f1:
-        st.session_state.market_filter = st.selectbox("市場区分", market_options, index=market_options.index(st.session_state.market_filter) if st.session_state.market_filter in market_options else 0)
+        st.session_state.market_filter = st.selectbox(
+            "市場区分",
+            market_options,
+            index=market_options.index(st.session_state.market_filter)
+            if st.session_state.market_filter in market_options else 0,
+        )
     with f2:
-        st.session_state.sector_filter = st.selectbox("業種", sector_options, index=sector_options.index(st.session_state.sector_filter) if st.session_state.sector_filter in sector_options else 0)
-
-    st.markdown("---")
-    
-    # 2. 年初来安値・値動き率（レンジ）フィルター（デフォルト15%）
-    p1, p2, p3 = st.columns([1.2, 1, 1.8])
-    with p1:
-        st.session_state.use_ytd = st.checkbox("年初来安値更新", value=st.session_state.use_ytd)
-    with p2:
-        st.session_state.use_range = st.checkbox("値動き率（レンジ）", value=st.session_state.use_range)
-    with p3:
-        st.session_state.min_range = st.number_input("最低レンジ幅 (%)", min_value=0.0, value=st.session_state.min_range, step=1.0, help="年初来の高値・安値の変動幅がこの割合以上の銘柄に絞ります")
+        st.session_state.sector_filter = st.selectbox(
+            "業種",
+            sector_options,
+            index=sector_options.index(st.session_state.sector_filter)
+            if st.session_state.sector_filter in sector_options else 0,
+        )
 
     st.markdown("---")
 
-    # 3. 財務条件フィルター（PER、PSR、ROE）
-    st.markdown("###### 💰 財務条件フィルター（制限をかけたい項目にチェック）")
-    t1, t2, t3 = st.columns(3)
-    with t1:
-        use_per = st.checkbox("PER制限", value=True)
-        max_per = st.number_input("PER上限 (倍)", min_value=0.0, value=15.0, step=1.0)
-    with t2:
-        use_psr = st.checkbox("PSR制限", value=False)
-        max_psr = st.number_input("PSR上限 (倍)", min_value=0.0, value=5.0, step=1.0)
-    with t3:
-        use_roe = st.checkbox("ROE制限", value=True)
-        min_roe = st.number_input("ROE下限 (%)", min_value=0.0, value=8.0, step=1.0)
+    # 2. 出来高フィルター（例：山田コンサルティンググループの直近20日平均出来高が1万株以上）
+    st.markdown("###### 📊 出来高フィルター")
+    v1, v2 = st.columns([1, 2])
+    with v1:
+        lookback_days = st.number_input("集計日数（営業日）", min_value=5, max_value=60, value=20, step=1)
+    with v2:
+        st.session_state.min_avg_volume = st.number_input(
+            "平均出来高の下限 (株)",
+            min_value=0,
+            value=st.session_state.min_avg_volume,
+            step=1000,
+            help="例：山田コンサルティンググループ(4792)のように、直近20日間の平均出来高が1万株以上の銘柄に絞り込みます",
+        )
 
     st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
 st.markdown("---")
-tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧 ＆ 財務確認"])
+tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘柄一覧"])
 
 # ============================================================
 # タブ1: スクリーニング結果
@@ -244,132 +127,89 @@ tab_screen, tab_list = st.tabs(["🔍 スクリーニング結果", "📋 全銘
 with tab_screen:
     if search_btn and not df_jpx.empty:
         target_df = df_jpx.copy()
-        
+
         if st.session_state.market_filter != "すべて":
             target_df = target_df[target_df['市場・商品区分'] == st.session_state.market_filter]
         if st.session_state.sector_filter != "すべて":
             target_df = target_df[target_df['33業種区分'] == st.session_state.sector_filter]
-            
+
         codes = target_df['コード'].astype(str).tolist()
 
         if len(codes) == 0:
             st.warning("⚠️ 条件に合致する銘柄がありませんでした。")
         else:
-            if st.session_state.use_ytd:
-                progress_text = "年初来安値＆値動き率を解析中..."
-                my_bar = st.progress(0, text=progress_text)
-                ytd_low_codes = []
+            progress_text = f"直近{lookback_days}日間の平均出来高を解析中..."
+            my_bar = st.progress(0, text=progress_text)
+            volume_results = []
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                    futures = {
-                        executor.submit(
-                            check_ytd_low,
-                            code,
-                            st.session_state.use_range,
-                            st.session_state.min_range
-                        ): code
-                        for code in codes
-                    }
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        result = future.result()
-                        if result:
-                            ytd_low_codes.append(result)
-                        my_bar.progress((i + 1) / len(codes), text=f"{progress_text} ({i+1}/{len(codes)})")
-                my_bar.empty()
-            else:
-                ytd_low_codes = codes
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {
+                    executor.submit(
+                        check_avg_volume,
+                        code,
+                        st.session_state.min_avg_volume,
+                        lookback_days,
+                    ): code
+                    for code in codes
+                }
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    result = future.result()
+                    if result:
+                        volume_results.append(result)
+                    my_bar.progress((i + 1) / len(codes), text=f"{progress_text} ({i+1}/{len(codes)})")
+            my_bar.empty()
 
             m1, m2 = st.columns(2)
             m1.metric("① 対象銘柄数", f"{len(codes)} 件")
-            m2.metric("② 価格条件クリア", f"{len(ytd_low_codes)} 件")
+            m2.metric("② 出来高条件クリア", f"{len(volume_results)} 件")
 
-            if len(ytd_low_codes) > 0:
+            st.markdown("---")
+            if volume_results:
+                st.success(f"🎉 条件をクリアした銘柄が **{len(volume_results)}件** 見つかりました！")
+
                 final_results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                    futures = {executor.submit(get_fundamentals, code): code for code in ytd_low_codes}
-                    for future in concurrent.futures.as_completed(futures):
-                        data = future.result()
-                        
-                        per_ok = True
-                        psr_ok = True
-                        roe_ok = True
-                        
-                        if use_per:
-                            per_ok = (data['PER'] is not None) and (data['PER'] <= max_per)
-                        if use_psr:
-                            psr_ok = (data['PSR'] is not None) and (data['PSR'] <= max_psr)
-                        if use_roe:
-                            roe_ok = (data['ROE'] is not None) and (data['ROE'] >= min_roe)
-                            
-                        if per_ok and psr_ok and roe_ok:
-                            row = target_df[target_df['コード'].astype(str) == data['code']].iloc[0]
-                            company_name = row['銘柄名']
-                            code = data['code']
-                            
-                            tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{company_name}"
-                            
-                            final_results.append({
-                                "コード": code,
-                                "銘柄名": tv_url,
-                                "会社名": company_name,
-                                "市場": row['市場・商品区分'],
-                                "業種": row['33業種区分'],
-                                "PER (倍)": round(data['PER'], 2) if data['PER'] else "-",
-                                "PSR (倍)": round(data['PSR'], 2) if data['PSR'] else "-",
-                                "ROE (%)": round(data['ROE'], 2) if data['ROE'] else "-",
-                                "summary": data['summary']
-                            })
-                
-                st.markdown("---")
-                if final_results:
-                    st.success(f"🎉 条件をクリアした銘柄が **{len(final_results)}件** 見つかりました！")
-                    result_df = pd.DataFrame(final_results)
+                for code, avg_volume in volume_results:
+                    row = target_df[target_df['コード'].astype(str) == code].iloc[0]
+                    company_name = row['銘柄名']
+                    tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{company_name}"
 
-                    column_config = {
-                        "銘柄名": st.column_config.LinkColumn(
-                            "銘柄名 (クリックでTradingViewへ)",
-                            help="クリックしてチャートを確認",
-                            display_text=r".*#(.+)"
-                        ),
-                        "会社名": None,
-                        "summary": None
-                    }
-                    
-                    st.dataframe(
-                        result_df,
-                        column_config=column_config,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # ブラウザAI用プロンプト生成
-                    st.markdown("### 📋 ブラウザAI用プロンプト生成")
-                    for res in final_results:
-                        with st.container(border=True):
-                            st.markdown(f"#### 🏢 {res['会社名']} <span style='font-size:0.8em; color:gray;'>({res['コード']})</span>", unsafe_allow_html=True)
-                            st.caption(f"📊 PER: **{res['PER (倍)']}倍** | PSR: **{res['PSR (倍)']}倍** | ROE: **{res['ROE (%)']}%**")
-                            
-                            prompt_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
-【企業名】 {res['会社名']} ({res['コード']})
-【事業概要】 {res['summary']}
-【主要指標】 PER: {res['PER (倍)']}倍 / PSR: {res['PSR (倍)']}倍 / ROE: {res['ROE (%)']}%
-強み、割安感、注目ポイントを3行程度で要約してください。"""
+                    final_results.append({
+                        "コード": code,
+                        "銘柄名": tv_url,
+                        "会社名": company_name,
+                        "市場": row['市場・商品区分'],
+                        "業種": row['33業種区分'],
+                        "平均出来高 (株)": int(round(avg_volume)),
+                    })
 
-                            with st.expander("📝 AI用プロンプト（コピー用）"):
-                                st.code(prompt_text, language="markdown")
+                result_df = pd.DataFrame(final_results).sort_values("平均出来高 (株)", ascending=False)
 
-                    for res in final_results:
-                        msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\nPER: {res['PER (倍)']} / ROE: {res['ROE (%)']}%"
-                        send_discord_notify(msg)
-                else:
-                    st.warning("⚠️ 指定した財務条件をクリアした銘柄はありませんでした。")
+                column_config = {
+                    "銘柄名": st.column_config.LinkColumn(
+                        "銘柄名 (クリックでTradingViewへ)",
+                        help="クリックしてチャートを確認",
+                        display_text=r".*#(.+)"
+                    ),
+                    "会社名": None,
+                }
+
+                st.dataframe(
+                    result_df,
+                    column_config=column_config,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                for res in final_results:
+                    msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {res['平均出来高 (株)']:,}株"
+                    send_discord_notify(msg)
             else:
-                st.warning("⚠️ 年初来安値・値動き率の条件に合致する銘柄はありませんでした。")
+                st.warning("⚠️ 指定した出来高条件をクリアした銘柄はありませんでした。")
     elif not search_btn:
         st.info("👆 上部のフィルターバーで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
 
 # ============================================================
-# タブ2: 全銘柄一覧 ＆ 財務確認
+# タブ2: 全銘柄一覧
 # ============================================================
 with tab_list:
     st.markdown("全銘柄の一覧です。銘柄コードを入力して検索するか、下のリストから確認してください。")
@@ -383,22 +223,22 @@ with tab_list:
                 c_name = target_row.iloc[0]['銘柄名']
                 code = search_code_input.strip()
                 tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{c_name}"
-                
+
                 with st.container(border=True):
-                    st.markdown(f"**[{c_name}]({tv_url})** （コード: `{code}`） / 市場: {target_row.iloc[0]['市場・商品区分']} / 業種: {target_row.iloc[0]['33業種区分']}")
-                    with st.spinner("財務指標を取得中..."):
-                        f_data = get_fundamentals(code)
-                        st.markdown(f"📊 **PER:** {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍 ｜ **PSR:** {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍 ｜ **ROE:** {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%")
-                        
-                        p_text = f"""以下の日本株企業についてファンダメンタル分析をまとめてください。
-【企業名】 {c_name} ({code})
-【事業概要】 {f_data['summary']}
-【主要指標】 PER: {round(f_data['PER'], 2) if f_data['PER'] else '-'}倍 / PSR: {round(f_data['PSR'], 2) if f_data['PSR'] else '-'}倍 / ROE: {round(f_data['ROE'], 2) if f_data['ROE'] else '-'}%
-強み、割安感、注目ポイントを3行程度で要約してください。"""
-                        st.code(p_text, language="markdown")
+                    st.markdown(
+                        f"**[{c_name}]({tv_url})** （コード: `{code}`） / "
+                        f"市場: {target_row.iloc[0]['市場・商品区分']} / 業種: {target_row.iloc[0]['33業種区分']}"
+                    )
+                    with st.spinner("出来高を取得中..."):
+                        result = check_avg_volume(code, 0, lookback_days=20)
+                        if result:
+                            _, avg_vol = result
+                            st.markdown(f"📊 **直近20日間の平均出来高:** {int(round(avg_vol)):,}株")
+                        else:
+                            st.markdown("📊 出来高データを取得できませんでした。")
             else:
                 st.error("指定されたコードが見つかりませんでした。")
-        
+
         st.markdown("---")
         st.caption("全銘柄リスト（最初の50件を表示）")
         sample_df = df_jpx.head(50)
