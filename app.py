@@ -10,10 +10,12 @@ if "market_filter" not in st.session_state:
     st.session_state.market_filter = "すべて"
 if "sector_filter" not in st.session_state:
     st.session_state.sector_filter = "すべて"
-if "min_avg_volume" not in st.session_state:
-    st.session_state.min_avg_volume = 10000
 if "data_source" not in st.session_state:
     st.session_state.data_source = "yfinance"
+
+# --- スクリーニング条件（固定値） ---
+LOOKBACK_DAYS = 20
+MIN_AVG_VOLUME = 10000
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -170,6 +172,23 @@ def send_discord_notify(msg):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
 
+def tradingview_financials_url(code):
+    """TradingViewの財務情報タブのURL（TradingViewアプリが入っている端末ではアプリが自動的に開く）"""
+    return f"https://www.tradingview.com/symbols/TSE-{code}/financials-overview/"
+
+
+GEMINI_URL = "https://gemini.google.com/app"
+
+
+def build_fundamental_prompt(company_name, code):
+    return (
+        f"{company_name}（証券コード: {code}、東京証券取引所上場）について、"
+        f"直近の業績・財務状況をふまえたファンダメンタル分析をお願いします。\n"
+        f"・強み、割安感、注目ポイントを3行程度で\n"
+        f"・年初来安値を更新し、出来高が増えている背景として考えられる要因も教えてください"
+    )
+
+
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
 if not df_jpx.empty:
@@ -230,23 +249,13 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. スクリーニング条件：出来高（足切り条件） × 年初来安値更新
+    # 2. スクリーニング条件（固定）：出来高（足切り条件） × 年初来安値更新
     st.markdown("###### 📉 スクリーニング条件（年初来安値更新）")
     st.caption(
-        "市場区分・業種で絞り込んだ銘柄のうち、下記の出来高条件を満たす銘柄を対象に"
-        "「当日の安値が年初来安値を更新」しているかをスクリーニングします。"
+        f"市場区分・業種で絞り込んだ銘柄のうち、直近{LOOKBACK_DAYS}日間の平均出来高が"
+        f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、"
+        "「当日の安値が年初来安値を更新」しているかをスクリーニングします（条件は固定です）。"
     )
-    v1, v2 = st.columns(2)
-    with v1:
-        lookback_days = st.number_input("出来高の集計日数（営業日）", min_value=5, max_value=60, value=20, step=1)
-    with v2:
-        st.session_state.min_avg_volume = st.number_input(
-            "平均出来高の下限 (株)",
-            min_value=0,
-            value=st.session_state.min_avg_volume,
-            step=1000,
-            help="例：山田コンサルティンググループ(4792)のように、直近20日間の平均出来高が1万株以上の銘柄に絞り込みます",
-        )
 
     st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
@@ -286,8 +295,8 @@ with tab_screen:
                         executor.submit(
                             screen_code,
                             code,
-                            st.session_state.min_avg_volume,
-                            lookback_days,
+                            MIN_AVG_VOLUME,
+                            LOOKBACK_DAYS,
                             st.session_state.data_source,
                             jquants_api_key,
                         ): code
@@ -313,37 +322,41 @@ with tab_screen:
                         code = res["code"]
                         row = target_df[target_df['コード'].astype(str) == code].iloc[0]
                         company_name = row['銘柄名']
-                        tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{company_name}"
 
                         final_results.append({
                             "コード": code,
-                            "銘柄名": tv_url,
                             "会社名": company_name,
                             "市場": row['市場・商品区分'],
                             "業種": row['33業種区分'],
                             "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
                         })
 
-                    result_df = pd.DataFrame(final_results)
-
-                    column_config = {
-                        "銘柄名": st.column_config.LinkColumn(
-                            "銘柄名 (クリックでTradingViewへ)",
-                            help="クリックしてチャートを確認",
-                            display_text=r".*#(.+)"
-                        ),
-                        "会社名": None,
-                    }
-
-                    st.dataframe(
-                        result_df,
-                        column_config=column_config,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
                     for res in final_results:
+                        tv_url = tradingview_financials_url(res["コード"])
                         vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
+
+                        with st.container(border=True):
+                            st.markdown(
+                                f"#### [{res['会社名']}]({tv_url}) "
+                                f"<span style='font-size:0.8em; color:gray;'>({res['コード']})</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(
+                                f"市場: {res['市場']} ｜ 業種: {res['業種']} ｜ "
+                                f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}"
+                            )
+                            st.caption("👆 企業名をタップするとTradingViewの財務情報ページを開きます（アプリがあれば自動的にアプリが開きます）")
+
+                            gc1, gc2 = st.columns([1, 2])
+                            with gc1:
+                                st.link_button("🤖 Geminiで調べる", GEMINI_URL, use_container_width=True)
+                            with gc2:
+                                with st.expander("📋 Geminiに貼り付ける質問文をコピー"):
+                                    st.code(
+                                        build_fundamental_prompt(res["会社名"], res["コード"]),
+                                        language="markdown",
+                                    )
+
                         msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {vol_text}"
                         send_discord_notify(msg)
                 else:
@@ -365,13 +378,20 @@ with tab_list:
             if not target_row.empty:
                 c_name = target_row.iloc[0]['銘柄名']
                 code = search_code_input.strip()
-                tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{c_name}"
+                tv_url = tradingview_financials_url(code)
 
                 with st.container(border=True):
                     st.markdown(
                         f"**[{c_name}]({tv_url})** （コード: `{code}`） / "
                         f"市場: {target_row.iloc[0]['市場・商品区分']} / 業種: {target_row.iloc[0]['33業種区分']}"
                     )
+                    gc1, gc2 = st.columns([1, 2])
+                    with gc1:
+                        st.link_button("🤖 Geminiで調べる", GEMINI_URL, use_container_width=True)
+                    with gc2:
+                        with st.expander("📋 Geminiに貼り付ける質問文をコピー"):
+                            st.code(build_fundamental_prompt(c_name, code), language="markdown")
+
                     if st.session_state.data_source == "J-Quants" and not jquants_api_key:
                         st.info("J-Quantsを選択中の場合はサイドバーでAPIキーを入力すると出来高・年初来安値を確認できます。")
                     else:
@@ -405,7 +425,7 @@ with tab_list:
         for _, row in sample_df.iterrows():
             code = row['コード']
             name = row['銘柄名']
-            tv_url = f"https://www.tradingview.com/symbols/TSE-{code}/#{name}"
+            tv_url = tradingview_financials_url(code)
             st.markdown(f"- **[{name}]({tv_url})** (`{code}`) - 市場: {row['市場・商品区分']} / 業種: {row['33業種区分']}")
     else:
         st.info("銘柄データが読み込まれていません。")
