@@ -39,11 +39,27 @@ except Exception:
 JQUANTS_BASE_URL = "https://api.jquants.com/v2"
 
 
+def classify_size(scale_label):
+    """
+    JPXの規模区分（TOPIX Core30 / Large70 / Mid400 / Small 1 / Small 2 等）から、
+    大型株（TOPIX100=Core30+Large70）／中型株（TOPIX Mid400）／小型株（それ以外）に分類する。
+    """
+    if not isinstance(scale_label, str):
+        return "小型株"
+    if scale_label in ("TOPIX Core30", "TOPIX Large70"):
+        return "大型株"
+    if scale_label == "TOPIX Mid400":
+        return "中型株"
+    return "小型株"
+
+
 @st.cache_data(ttl=86400)
 def load_jpx_data():
     try:
         df = pd.read_excel("data_j.xls")
         df = df[df['市場・商品区分'].notna()]
+        if '規模区分' in df.columns:
+            df['規模カテゴリ'] = df['規模区分'].apply(classify_size)
         return df
     except Exception as e:
         st.error(f"銘柄データの取得に失敗しました: data_j.xls ファイルを確認してください: {e}")
@@ -189,6 +205,36 @@ def build_fundamental_prompt(company_name, code):
     )
 
 
+def render_company_card(company_name, code, key_prefix, caption_parts=None):
+    """
+    企業名（TradingView財務ページへのリンク）＋Geminiでのファンダメンタル分析導線をまとめたカードを表示する。
+    key_prefix: 同じコードの銘柄が複数箇所（スクリーニング結果・規模別一覧など）に出ても
+                ウィジェットIDが衝突しないようにするための接頭辞。
+    """
+    tv_url = tradingview_financials_url(code)
+    with st.container(border=True):
+        st.markdown(
+            f"#### [{company_name}]({tv_url}) "
+            f"<span style='font-size:0.8em; color:gray;'>({code})</span>",
+            unsafe_allow_html=True,
+        )
+        if caption_parts:
+            st.caption(" ｜ ".join(caption_parts))
+        st.caption("👆 企業名をタップするとTradingViewの財務情報ページを開きます（アプリがあれば自動的にアプリが開きます）")
+
+        gc1, gc2 = st.columns([1, 2])
+        with gc1:
+            st.link_button(
+                "🤖 Geminiで調べる",
+                GEMINI_URL,
+                use_container_width=True,
+                key=f"{key_prefix}_gemini_btn_{code}",
+            )
+        with gc2:
+            with st.expander(f"📋 Geminiに貼り付ける質問文をコピー（{company_name}）"):
+                st.code(build_fundamental_prompt(company_name, code), language="markdown")
+
+
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
 if not df_jpx.empty:
@@ -332,30 +378,18 @@ with tab_screen:
                         })
 
                     for res in final_results:
-                        tv_url = tradingview_financials_url(res["コード"])
                         vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
 
-                        with st.container(border=True):
-                            st.markdown(
-                                f"#### [{res['会社名']}]({tv_url}) "
-                                f"<span style='font-size:0.8em; color:gray;'>({res['コード']})</span>",
-                                unsafe_allow_html=True,
-                            )
-                            st.caption(
-                                f"市場: {res['市場']} ｜ 業種: {res['業種']} ｜ "
-                                f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}"
-                            )
-                            st.caption("👆 企業名をタップするとTradingViewの財務情報ページを開きます（アプリがあれば自動的にアプリが開きます）")
-
-                            gc1, gc2 = st.columns([1, 2])
-                            with gc1:
-                                st.link_button("🤖 Geminiで調べる", GEMINI_URL, use_container_width=True)
-                            with gc2:
-                                with st.expander("📋 Geminiに貼り付ける質問文をコピー"):
-                                    st.code(
-                                        build_fundamental_prompt(res["会社名"], res["コード"]),
-                                        language="markdown",
-                                    )
+                        render_company_card(
+                            res["会社名"],
+                            res["コード"],
+                            key_prefix="screen",
+                            caption_parts=[
+                                f"市場: {res['市場']}",
+                                f"業種: {res['業種']}",
+                                f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}",
+                            ],
+                        )
 
                         msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {vol_text}"
                         send_discord_notify(msg)
@@ -378,20 +412,18 @@ with tab_list:
             if not target_row.empty:
                 c_name = target_row.iloc[0]['銘柄名']
                 code = search_code_input.strip()
-                tv_url = tradingview_financials_url(code)
+
+                render_company_card(
+                    c_name,
+                    code,
+                    key_prefix="search",
+                    caption_parts=[
+                        f"市場: {target_row.iloc[0]['市場・商品区分']}",
+                        f"業種: {target_row.iloc[0]['33業種区分']}",
+                    ],
+                )
 
                 with st.container(border=True):
-                    st.markdown(
-                        f"**[{c_name}]({tv_url})** （コード: `{code}`） / "
-                        f"市場: {target_row.iloc[0]['市場・商品区分']} / 業種: {target_row.iloc[0]['33業種区分']}"
-                    )
-                    gc1, gc2 = st.columns([1, 2])
-                    with gc1:
-                        st.link_button("🤖 Geminiで調べる", GEMINI_URL, use_container_width=True)
-                    with gc2:
-                        with st.expander("📋 Geminiに貼り付ける質問文をコピー"):
-                            st.code(build_fundamental_prompt(c_name, code), language="markdown")
-
                     if st.session_state.data_source == "J-Quants" and not jquants_api_key:
                         st.info("J-Quantsを選択中の場合はサイドバーでAPIキーを入力すると出来高・年初来安値を確認できます。")
                     else:
@@ -420,12 +452,50 @@ with tab_list:
                 st.error("指定されたコードが見つかりませんでした。")
 
         st.markdown("---")
-        st.caption("全銘柄リスト（最初の50件を表示）")
-        sample_df = df_jpx.head(50)
-        for _, row in sample_df.iterrows():
-            code = row['コード']
-            name = row['銘柄名']
-            tv_url = tradingview_financials_url(code)
-            st.markdown(f"- **[{name}]({tv_url})** (`{code}`) - 市場: {row['市場・商品区分']} / 業種: {row['33業種区分']}")
+        st.markdown("###### 🏷️ 規模別一覧（TOPIXの規模区分に基づく）")
+        st.caption(
+            "大型株：TOPIX100（Core30+Large70）対象の上位100銘柄 ｜ "
+            "中型株：TOPIX Mid400対象の400銘柄 ｜ "
+            "小型株：それ以外のTOPIX Small対象銘柄"
+        )
+
+        if '規模カテゴリ' in df_jpx.columns:
+            size_label_map = {
+                "大型株（TOPIX100）": "大型株",
+                "中型株（TOPIX Mid400）": "中型株",
+                "小型株（TOPIX Small）": "小型株",
+            }
+            size_option = st.radio(
+                "規模区分を選択",
+                list(size_label_map.keys()),
+                horizontal=True,
+            )
+            size_df = df_jpx[df_jpx['規模カテゴリ'] == size_label_map[size_option]]
+
+            list_search = st.text_input("銘柄名で絞り込み（任意）", value="", key="size_list_search")
+            if list_search:
+                size_df = size_df[size_df['銘柄名'].str.contains(list_search, na=False)]
+
+            st.caption(f"該当銘柄数: {len(size_df)}件")
+
+            display_df = size_df.head(50)
+            if len(size_df) > 50:
+                st.caption("※ 先頭50件を表示しています。銘柄名で絞り込むと目的の銘柄を見つけやすくなります。")
+
+            for _, row in display_df.iterrows():
+                render_company_card(
+                    row['銘柄名'],
+                    str(row['コード']),
+                    key_prefix=f"sizelist_{size_label_map[size_option]}",
+                    caption_parts=[
+                        f"市場: {row['市場・商品区分']}",
+                        f"業種: {row['33業種区分']}",
+                    ],
+                )
+        else:
+            st.warning(
+                "銘柄データに「規模区分」列が見つからなかったため、規模別一覧は表示できません。"
+                " data_j.xlsが最新版（規模区分の列を含むもの）か確認してください。"
+            )
     else:
         st.info("銘柄データが読み込まれていません。")
