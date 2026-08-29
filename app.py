@@ -188,9 +188,20 @@ def send_discord_notify(msg):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
 
-def tradingview_financials_url(code):
-    """TradingViewの財務情報タブのURL（TradingViewアプリが入っている端末ではアプリが自動的に開く）"""
-    return f"https://www.tradingview.com/symbols/TSE-{code}/financials-overview/"
+def tradingview_symbol_url(code):
+    """
+    TradingViewのシンボルページ（日本語版ドメイン）のURL。
+    TradingViewアプリは tradingview.com ドメイン全体をユニバーサルリンクとして
+    登録しているため、Safari/Chromeで直接開けばアプリがあれば自動的にアプリ側が開く。
+    ただし財務情報タブなどサブページはアプリ起動の対象外になる場合があるため、
+    確実にアプリが開くシンボルのトップページに統一している
+    （開いた後にアプリ内の「財務」タブを選ぶと財務情報が見られる）。
+    ※ Streamlitのプレビュー画面やアプリ内ブラウザ（WebView）など、
+      iframe・埋め込みブラウザ内で開いた場合はユニバーサルリンクが機能せず
+      ブラウザ表示になることがある。その場合は一度ブラウザ（Safari/Chrome）で
+      直接アプリを開いてから試すと動作しやすい。
+    """
+    return f"https://jp.tradingview.com/symbols/TSE-{code}/"
 
 
 GEMINI_URL = "https://gemini.google.com/app"
@@ -211,7 +222,7 @@ def render_company_card(company_name, code, key_prefix, caption_parts=None):
     key_prefix: 同じコードの銘柄が複数箇所（スクリーニング結果・規模別一覧など）に出ても
                 ウィジェットIDが衝突しないようにするための接頭辞。
     """
-    tv_url = tradingview_financials_url(code)
+    tv_url = tradingview_symbol_url(code)
     with st.container(border=True):
         st.markdown(
             f"#### [{company_name}]({tv_url}) "
@@ -220,7 +231,10 @@ def render_company_card(company_name, code, key_prefix, caption_parts=None):
         )
         if caption_parts:
             st.caption(" ｜ ".join(caption_parts))
-        st.caption("👆 企業名をタップするとTradingViewの財務情報ページを開きます（アプリがあれば自動的にアプリが開きます）")
+        st.caption(
+            "👆 企業名をタップするとTradingView（日本語）のページを開きます"
+            "（アプリがあれば自動的にアプリが開きます）。開いたら「財務」タブで財務情報を確認できます。"
+        )
 
         gc1, gc2 = st.columns([1, 2])
         with gc1:
@@ -359,42 +373,81 @@ with tab_screen:
                 m1.metric("① 対象銘柄数", f"{len(codes)} 件")
                 m2.metric("② 条件クリア", f"{len(screen_results)} 件")
 
-                st.markdown("---")
-                if screen_results:
-                    st.success(f"🎉 条件をクリアした銘柄が **{len(screen_results)}件** 見つかりました！")
+                final_results = []
+                for res in screen_results:
+                    code = res["code"]
+                    row = target_df[target_df['コード'].astype(str) == code].iloc[0]
+                    company_name = row['銘柄名']
 
-                    final_results = []
-                    for res in screen_results:
-                        code = res["code"]
-                        row = target_df[target_df['コード'].astype(str) == code].iloc[0]
-                        company_name = row['銘柄名']
+                    final_results.append({
+                        "コード": code,
+                        "会社名": company_name,
+                        "市場": row['市場・商品区分'],
+                        "業種": row['33業種区分'],
+                        "規模カテゴリ": row['規模カテゴリ'] if '規模カテゴリ' in row.index else None,
+                        "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
+                    })
 
-                        final_results.append({
-                            "コード": code,
-                            "会社名": company_name,
-                            "市場": row['市場・商品区分'],
-                            "業種": row['33業種区分'],
-                            "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
-                        })
+                # Discord通知はスクリーニング実行時（このタイミング）だけ送る
+                for res in final_results:
+                    vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
+                    msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {vol_text}"
+                    send_discord_notify(msg)
 
-                    for res in final_results:
-                        vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
+                # 規模フィルターの切替（st.radio等）で再実行されても結果を保持できるようセッションに保存
+                st.session_state.last_screen_results = final_results
+                st.session_state.last_screen_counts = (len(codes), len(screen_results))
 
-                        render_company_card(
-                            res["会社名"],
-                            res["コード"],
-                            key_prefix="screen",
-                            caption_parts=[
-                                f"市場: {res['市場']}",
-                                f"業種: {res['業種']}",
-                                f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}",
-                            ],
-                        )
+    # --- スクリーニング結果の表示（規模フィルター含む） ---
+    if "last_screen_results" in st.session_state:
+        final_results = st.session_state.last_screen_results
+        total_count, hit_count = st.session_state.last_screen_counts
 
-                        msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {vol_text}"
-                        send_discord_notify(msg)
-                else:
-                    st.warning("⚠️ 指定した条件をクリアした銘柄はありませんでした。")
+        if not search_btn:
+            m1, m2 = st.columns(2)
+            m1.metric("① 対象銘柄数", f"{total_count} 件")
+            m2.metric("② 条件クリア", f"{hit_count} 件")
+
+        st.markdown("---")
+
+        if final_results:
+            st.success(f"🎉 条件をクリアした銘柄が **{len(final_results)}件** 見つかりました！")
+
+            has_size_category = any(r.get("規模カテゴリ") for r in final_results)
+            display_results = final_results
+            if has_size_category:
+                size_label_map = {
+                    "すべて": None,
+                    "大型株（TOPIX100）": "大型株",
+                    "中型株（TOPIX Mid400）": "中型株",
+                    "小型株（TOPIX Small）": "小型株",
+                }
+                size_option = st.radio(
+                    "規模区分で絞り込み",
+                    list(size_label_map.keys()),
+                    horizontal=True,
+                    key="screen_size_filter",
+                )
+                target_size = size_label_map[size_option]
+                if target_size:
+                    display_results = [r for r in final_results if r.get("規模カテゴリ") == target_size]
+                st.caption(f"表示件数: {len(display_results)}件")
+
+            for res in display_results:
+                vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
+                caption_parts = [f"市場: {res['市場']}", f"業種: {res['業種']}"]
+                if res.get("規模カテゴリ"):
+                    caption_parts.append(f"規模: {res['規模カテゴリ']}")
+                caption_parts.append(f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}")
+
+                render_company_card(
+                    res["会社名"],
+                    res["コード"],
+                    key_prefix="screen",
+                    caption_parts=caption_parts,
+                )
+        else:
+            st.warning("⚠️ 指定した条件をクリアした銘柄はありませんでした。")
     elif not search_btn:
         st.info("👆 上部のフィルターバーで条件を設定して「スクリーニングを実行する」ボタンを押してください。")
 
