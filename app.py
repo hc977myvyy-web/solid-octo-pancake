@@ -12,10 +12,6 @@ if "sector_filter" not in st.session_state:
     st.session_state.sector_filter = "すべて"
 if "min_avg_volume" not in st.session_state:
     st.session_state.min_avg_volume = 10000
-if "use_ytd" not in st.session_state:
-    st.session_state.use_ytd = True
-if "use_volume" not in st.session_state:
-    st.session_state.use_volume = True
 if "data_source" not in st.session_state:
     st.session_state.data_source = "yfinance"
 
@@ -132,39 +128,39 @@ def get_price_history(code, from_dt, to_dt, source, api_key=None):
 # スクリーニング条件の判定
 # ============================================================
 
-def screen_code(code, use_ytd, use_volume, min_avg_volume, lookback_days, source, api_key=None):
+def screen_code(code, min_avg_volume, lookback_days, source, api_key=None):
     """
-    1銘柄に対して「年初来安値更新」「直近N日平均出来高」の条件をまとめて判定する。
-    どちらもチェックが入っている条件だけを見て、すべて満たせば結果を返す。
+    1銘柄に対して「年初来安値更新」かつ「直近N日平均出来高が下限以上」を判定する。
+    出来高フィルターは市場区分・業種で絞り込んだ銘柄を対象に、
+    年初来安値をスクリーニングするための足切り条件として常に適用する。
+    両方を満たした場合のみ結果を返す。
     """
     today = date.today()
     jan1 = date(today.year, 1, 1)
     # 出来高判定用に土日・祝日を考慮して少し多めに取得する
     volume_from = today - timedelta(days=int(lookback_days * 2.5) + 10)
-    from_dt = min(jan1, volume_from) if use_ytd else volume_from
+    from_dt = min(jan1, volume_from)
 
     hist = get_price_history(code, from_dt, today, source, api_key)
     if hist is None or hist.empty:
         return None
 
-    avg_volume = None
+    # 1. 出来高条件（足切り）
+    if len(hist) < lookback_days:
+        return None
+    recent_vol = hist['Volume'].tail(lookback_days)
+    avg_volume = recent_vol.mean()
+    if pd.isna(avg_volume) or avg_volume < min_avg_volume:
+        return None
 
-    if use_ytd:
-        ytd_hist = hist[hist.index.date >= jan1]
-        if len(ytd_hist) < 2:
-            return None
-        ytd_low = ytd_hist['Low'].min()
-        latest_low = ytd_hist['Low'].iloc[-1]
-        if latest_low > ytd_low:
-            return None
-
-    if use_volume:
-        if len(hist) < lookback_days:
-            return None
-        recent_vol = hist['Volume'].tail(lookback_days)
-        avg_volume = recent_vol.mean()
-        if pd.isna(avg_volume) or avg_volume < min_avg_volume:
-            return None
+    # 2. 年初来安値更新の条件
+    ytd_hist = hist[hist.index.date >= jan1]
+    if len(ytd_hist) < 2:
+        return None
+    ytd_low = ytd_hist['Low'].min()
+    latest_low = ytd_hist['Low'].iloc[-1]
+    if latest_low > ytd_low:
+        return None
 
     return {"code": code, "avg_volume": avg_volume}
 
@@ -234,18 +230,15 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. 年初来安値フィルター
-    st.session_state.use_ytd = st.checkbox("📉 年初来安値更新（当日の安値が年初来安値を更新）", value=st.session_state.use_ytd)
-
-    st.markdown("---")
-
-    # 3. 出来高フィルター（例：山田コンサルティンググループの直近20日平均出来高が1万株以上）
-    st.markdown("###### 📊 出来高フィルター")
-    v0, v1, v2 = st.columns([1, 1, 2])
-    with v0:
-        st.session_state.use_volume = st.checkbox("平均出来高で絞り込む", value=st.session_state.use_volume)
+    # 2. スクリーニング条件：出来高（足切り条件） × 年初来安値更新
+    st.markdown("###### 📉 スクリーニング条件（年初来安値更新）")
+    st.caption(
+        "市場区分・業種で絞り込んだ銘柄のうち、下記の出来高条件を満たす銘柄を対象に"
+        "「当日の安値が年初来安値を更新」しているかをスクリーニングします。"
+    )
+    v1, v2 = st.columns(2)
     with v1:
-        lookback_days = st.number_input("集計日数（営業日）", min_value=5, max_value=60, value=20, step=1)
+        lookback_days = st.number_input("出来高の集計日数（営業日）", min_value=5, max_value=60, value=20, step=1)
     with v2:
         st.session_state.min_avg_volume = st.number_input(
             "平均出来高の下限 (株)",
@@ -268,8 +261,6 @@ with tab_screen:
     if search_btn and not df_jpx.empty:
         if st.session_state.data_source == "J-Quants" and not jquants_api_key:
             st.error("J-Quantsを選択している場合はAPIキーが必要です。サイドバーから入力してください。")
-        elif not st.session_state.use_ytd and not st.session_state.use_volume:
-            st.warning("⚠️ 「年初来安値更新」「出来高で絞り込む」のいずれか1つ以上を選択してください。")
         else:
             target_df = df_jpx.copy()
 
@@ -295,8 +286,6 @@ with tab_screen:
                         executor.submit(
                             screen_code,
                             code,
-                            st.session_state.use_ytd,
-                            st.session_state.use_volume,
                             st.session_state.min_avg_volume,
                             lookback_days,
                             st.session_state.data_source,
