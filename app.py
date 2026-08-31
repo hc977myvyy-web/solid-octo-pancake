@@ -12,6 +12,10 @@ if "sector_filter" not in st.session_state:
     st.session_state.sector_filter = "すべて"
 if "data_source" not in st.session_state:
     st.session_state.data_source = "yfinance"
+if "use_ytd_low" not in st.session_state:
+    st.session_state.use_ytd_low = True
+if "use_decline" not in st.session_state:
+    st.session_state.use_decline = True
 
 # --- スクリーニング条件（固定値） ---
 LOOKBACK_DAYS = 20
@@ -147,21 +151,38 @@ def get_price_history(code, from_dt, to_dt, source, api_key=None):
 # スクリーニング条件の判定
 # ============================================================
 
-def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, decline_lookback_days, source, api_key=None):
+def screen_code(
+    code,
+    min_avg_volume,
+    lookback_days,
+    decline_threshold_pct,
+    decline_lookback_days,
+    use_ytd_low,
+    use_decline,
+    source,
+    api_key=None,
+):
     """
-    1銘柄に対して以下をすべて満たすかを判定する：
-      1. 直近N日平均出来高が下限以上（足切り条件）
-      2. 当日の安値が年初来安値を更新している
-      3. 直近decline_lookback_days日間の高値から現在値（終値）までの下落率が約decline_threshold_pct%以上
-         （※ 2の「年初来」とは別の期間として、直近3ヶ月を基準に判定する）
-    すべて満たした場合のみ結果を返す。
+    1銘柄に対して以下を判定する：
+      1. 直近N日平均出来高が下限以上（常に適用する足切り条件）
+      2. use_ytd_low が True の場合のみ：当日の安値が年初来安値を更新しているか
+      3. use_decline が True の場合のみ：直近decline_lookback_days日間の高値から
+         現在値（終値）までの下落率が約decline_threshold_pct%以上か
+    2・3は互いに独立した条件で、チェックが入っているものだけを判定に使う
+    （両方チェックされていればAND条件になる）。
     """
     today = date.today()
     jan1 = date(today.year, 1, 1)
     decline_from = today - timedelta(days=decline_lookback_days)
     # 出来高判定用に土日・祝日を考慮して少し多めに取得する
     volume_from = today - timedelta(days=int(lookback_days * 2.5) + 10)
-    from_dt = min(jan1, decline_from, volume_from)
+
+    from_candidates = [volume_from]
+    if use_ytd_low:
+        from_candidates.append(jan1)
+    if use_decline:
+        from_candidates.append(decline_from)
+    from_dt = min(from_candidates)
 
     hist = get_price_history(code, from_dt, today, source, api_key)
     if hist is None or hist.empty:
@@ -175,30 +196,41 @@ def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, decl
     if pd.isna(avg_volume) or avg_volume < min_avg_volume:
         return None
 
+    ytd_low_hit = None
+    decline_pct = None
+
     # 2. 年初来安値更新の条件
-    ytd_hist = hist[hist.index.date >= jan1]
-    if len(ytd_hist) < 2:
-        return None
-    ytd_low = ytd_hist['Low'].min()
-    latest_low = ytd_hist['Low'].iloc[-1]
-    if latest_low > ytd_low:
-        return None
+    if use_ytd_low:
+        ytd_hist = hist[hist.index.date >= jan1]
+        if len(ytd_hist) < 2:
+            return None
+        ytd_low = ytd_hist['Low'].min()
+        latest_low = ytd_hist['Low'].iloc[-1]
+        ytd_low_hit = latest_low <= ytd_low
+        if not ytd_low_hit:
+            return None
 
-    # 3. 直近3ヶ月の高値からの下落率の条件（年初来とは別の期間で判定）
-    if 'Close' not in hist.columns:
-        return None
-    recent_hist = hist[hist.index.date >= decline_from]
-    if len(recent_hist) < 2:
-        return None
-    recent_high = recent_hist['High'].max()
-    latest_close = hist['Close'].iloc[-1]
-    if pd.isna(recent_high) or pd.isna(latest_close) or recent_high <= 0:
-        return None
-    decline_pct = (recent_high - latest_close) / recent_high * 100
-    if decline_pct < decline_threshold_pct:
-        return None
+    # 3. 直近3ヶ月の高値からの下落率の条件
+    if use_decline:
+        if 'Close' not in hist.columns:
+            return None
+        recent_hist = hist[hist.index.date >= decline_from]
+        if len(recent_hist) < 2:
+            return None
+        recent_high = recent_hist['High'].max()
+        latest_close = hist['Close'].iloc[-1]
+        if pd.isna(recent_high) or pd.isna(latest_close) or recent_high <= 0:
+            return None
+        decline_pct = (recent_high - latest_close) / recent_high * 100
+        if decline_pct < decline_threshold_pct:
+            return None
 
-    return {"code": code, "avg_volume": avg_volume, "decline_pct": decline_pct}
+    return {
+        "code": code,
+        "avg_volume": avg_volume,
+        "ytd_low_hit": ytd_low_hit,
+        "decline_pct": decline_pct,
+    }
 
 
 def send_discord_notify(msg):
@@ -327,15 +359,23 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. スクリーニング条件（固定）：出来高（足切り条件） × 年初来安値更新 × 下落率
-    st.markdown("###### 📉 スクリーニング条件（年初来安値更新・急落銘柄）")
+    # 2. スクリーニング条件：出来高（常時足切り） × 年初来安値更新／下落率（それぞれON/OFF可能）
+    st.markdown("###### 📉 スクリーニング条件")
     st.caption(
         f"市場区分・業種で絞り込んだ銘柄のうち、直近{LOOKBACK_DAYS}日間の平均出来高が"
-        f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、"
-        "「当日の安値が年初来安値を更新」し、かつ"
-        f"「直近3ヶ月の高値から現在値までの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上」の銘柄をスクリーニングします"
-        "（条件は固定です）。"
+        f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、下記でチェックした条件（AND）でスクリーニングします。"
     )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.use_ytd_low = st.checkbox(
+            "年初来安値更新（当日の安値が年初来安値を更新）",
+            value=st.session_state.use_ytd_low,
+        )
+    with c2:
+        st.session_state.use_decline = st.checkbox(
+            f"直近3ヶ月の高値からの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上",
+            value=st.session_state.use_decline,
+        )
 
     st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
@@ -350,6 +390,8 @@ with tab_screen:
     if search_btn and not df_jpx.empty:
         if st.session_state.data_source == "J-Quants" and not jquants_api_key:
             st.error("J-Quantsを選択している場合はAPIキーが必要です。サイドバーから入力してください。")
+        elif not st.session_state.use_ytd_low and not st.session_state.use_decline:
+            st.warning("⚠️ 「年初来安値更新」「下落率」のいずれか1つ以上にチェックを入れてください。")
         else:
             target_df = df_jpx.copy()
 
@@ -379,6 +421,8 @@ with tab_screen:
                             LOOKBACK_DAYS,
                             DECLINE_THRESHOLD_PCT,
                             DECLINE_LOOKBACK_DAYS,
+                            st.session_state.use_ytd_low,
+                            st.session_state.use_decline,
                             st.session_state.data_source,
                             jquants_api_key,
                         ): code
@@ -408,22 +452,28 @@ with tab_screen:
                         "業種": row['33業種区分'],
                         "規模カテゴリ": row['規模カテゴリ'] if '規模カテゴリ' in row.index else None,
                         "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
+                        "年初来安値更新": res.get("ytd_low_hit"),
                         "下落率 (%)": round(res["decline_pct"], 1) if res.get("decline_pct") is not None else "-",
                     })
 
                 # Discord通知はスクリーニング実行時（このタイミング）だけ送る
                 for res in final_results:
                     vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
-                    decline_text = f"{res['下落率 (%)']}%" if res['下落率 (%)'] != "-" else "-"
-                    msg = (
-                        f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n"
-                        f"平均出来高: {vol_text} ｜ 直近3ヶ月高値からの下落率: {decline_text}"
-                    )
+                    parts = [f"平均出来高: {vol_text}"]
+                    if res["年初来安値更新"] is not None:
+                        parts.append("年初来安値更新: 該当")
+                    if res['下落率 (%)'] != "-":
+                        parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
+                    msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n" + " ｜ ".join(parts)
                     send_discord_notify(msg)
 
                 # 規模フィルターの切替（st.radio等）で再実行されても結果を保持できるようセッションに保存
                 st.session_state.last_screen_results = final_results
                 st.session_state.last_screen_counts = (len(codes), len(screen_results))
+                st.session_state.last_screen_conditions = (
+                    st.session_state.use_ytd_low,
+                    st.session_state.use_decline,
+                )
 
     # --- スクリーニング結果の表示（規模フィルター含む） ---
     if "last_screen_results" in st.session_state:
@@ -460,14 +510,18 @@ with tab_screen:
                     display_results = [r for r in final_results if r.get("規模カテゴリ") == target_size]
                 st.caption(f"表示件数: {len(display_results)}件")
 
+            used_ytd_low, used_decline = st.session_state.get("last_screen_conditions", (True, True))
+
             for res in display_results:
                 vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
-                decline_text = f"{res['下落率 (%)']}%" if res.get('下落率 (%)', "-") != "-" else "-"
                 caption_parts = [f"市場: {res['市場']}", f"業種: {res['業種']}"]
                 if res.get("規模カテゴリ"):
                     caption_parts.append(f"規模: {res['規模カテゴリ']}")
                 caption_parts.append(f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}")
-                caption_parts.append(f"直近3ヶ月高値からの下落率: {decline_text}")
+                if used_ytd_low:
+                    caption_parts.append("年初来安値更新: 該当")
+                if used_decline and res.get('下落率 (%)', "-") != "-":
+                    caption_parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
 
                 render_company_card(
                     res["会社名"],
