@@ -64,6 +64,11 @@ def load_jpx_data():
     try:
         df = pd.read_excel("data_j.xls")
         df = df[df['市場・商品区分'].notna()]
+
+        # ETF・ETN・REIT・インフラファンド・出資証券などの投資信託系を除外し、
+        # 普通株式（プライム／スタンダード／グロース＝「内国株式」）のみを対象にする
+        df = df[df['市場・商品区分'].str.contains('内国株式', na=False)]
+
         if '規模区分' in df.columns:
             df['規模カテゴリ'] = df['規模区分'].apply(classify_size)
         return df
