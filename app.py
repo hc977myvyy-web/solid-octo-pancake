@@ -16,7 +16,8 @@ if "data_source" not in st.session_state:
 # --- スクリーニング条件（固定値） ---
 LOOKBACK_DAYS = 20
 MIN_AVG_VOLUME = 10000
-DECLINE_THRESHOLD_PCT = 20.0  # 年初来高値からの下落率（約20%以上）
+DECLINE_THRESHOLD_PCT = 20.0  # 直近3ヶ月の高値からの下落率（約20%以上）
+DECLINE_LOOKBACK_DAYS = 92  # 「直近3ヶ月」の目安（暦日ベース）
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -146,19 +147,21 @@ def get_price_history(code, from_dt, to_dt, source, api_key=None):
 # スクリーニング条件の判定
 # ============================================================
 
-def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, source, api_key=None):
+def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, decline_lookback_days, source, api_key=None):
     """
     1銘柄に対して以下をすべて満たすかを判定する：
       1. 直近N日平均出来高が下限以上（足切り条件）
       2. 当日の安値が年初来安値を更新している
-      3. 年初来高値から現在値（終値）までの下落率が約decline_threshold_pct%以上
+      3. 直近decline_lookback_days日間の高値から現在値（終値）までの下落率が約decline_threshold_pct%以上
+         （※ 2の「年初来」とは別の期間として、直近3ヶ月を基準に判定する）
     すべて満たした場合のみ結果を返す。
     """
     today = date.today()
     jan1 = date(today.year, 1, 1)
+    decline_from = today - timedelta(days=decline_lookback_days)
     # 出来高判定用に土日・祝日を考慮して少し多めに取得する
     volume_from = today - timedelta(days=int(lookback_days * 2.5) + 10)
-    from_dt = min(jan1, volume_from)
+    from_dt = min(jan1, decline_from, volume_from)
 
     hist = get_price_history(code, from_dt, today, source, api_key)
     if hist is None or hist.empty:
@@ -181,14 +184,17 @@ def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, sour
     if latest_low > ytd_low:
         return None
 
-    # 3. 年初来高値からの下落率の条件
-    if 'Close' not in ytd_hist.columns:
+    # 3. 直近3ヶ月の高値からの下落率の条件（年初来とは別の期間で判定）
+    if 'Close' not in hist.columns:
         return None
-    ytd_high = ytd_hist['High'].max()
-    latest_close = ytd_hist['Close'].iloc[-1]
-    if pd.isna(ytd_high) or pd.isna(latest_close) or ytd_high <= 0:
+    recent_hist = hist[hist.index.date >= decline_from]
+    if len(recent_hist) < 2:
         return None
-    decline_pct = (ytd_high - latest_close) / ytd_high * 100
+    recent_high = recent_hist['High'].max()
+    latest_close = hist['Close'].iloc[-1]
+    if pd.isna(recent_high) or pd.isna(latest_close) or recent_high <= 0:
+        return None
+    decline_pct = (recent_high - latest_close) / recent_high * 100
     if decline_pct < decline_threshold_pct:
         return None
 
@@ -327,7 +333,7 @@ with st.container(border=True):
         f"市場区分・業種で絞り込んだ銘柄のうち、直近{LOOKBACK_DAYS}日間の平均出来高が"
         f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、"
         "「当日の安値が年初来安値を更新」し、かつ"
-        f"「年初来高値から現在値までの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上」の銘柄をスクリーニングします"
+        f"「直近3ヶ月の高値から現在値までの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上」の銘柄をスクリーニングします"
         "（条件は固定です）。"
     )
 
@@ -372,6 +378,7 @@ with tab_screen:
                             MIN_AVG_VOLUME,
                             LOOKBACK_DAYS,
                             DECLINE_THRESHOLD_PCT,
+                            DECLINE_LOOKBACK_DAYS,
                             st.session_state.data_source,
                             jquants_api_key,
                         ): code
@@ -410,7 +417,7 @@ with tab_screen:
                     decline_text = f"{res['下落率 (%)']}%" if res['下落率 (%)'] != "-" else "-"
                     msg = (
                         f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n"
-                        f"平均出来高: {vol_text} ｜ 年初来高値からの下落率: {decline_text}"
+                        f"平均出来高: {vol_text} ｜ 直近3ヶ月高値からの下落率: {decline_text}"
                     )
                     send_discord_notify(msg)
 
@@ -460,7 +467,7 @@ with tab_screen:
                 if res.get("規模カテゴリ"):
                     caption_parts.append(f"規模: {res['規模カテゴリ']}")
                 caption_parts.append(f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}")
-                caption_parts.append(f"年初来高値からの下落率: {decline_text}")
+                caption_parts.append(f"直近3ヶ月高値からの下落率: {decline_text}")
 
                 render_company_card(
                     res["会社名"],
