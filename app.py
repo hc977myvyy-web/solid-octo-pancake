@@ -16,6 +16,7 @@ if "data_source" not in st.session_state:
 # --- スクリーニング条件（固定値） ---
 LOOKBACK_DAYS = 20
 MIN_AVG_VOLUME = 10000
+DECLINE_THRESHOLD_PCT = 20.0  # 年初来高値からの下落率（約20%以上）
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -72,14 +73,13 @@ def load_jpx_data():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yfinance_history(code, from_date_str, to_date_str):
-    """yfinanceから日足データ（High, Low, Volume）を取得する"""
+    """yfinanceから日足データ（High, Low, Close, Volume）を取得する"""
     try:
         ticker = yf.Ticker(f"{code}.T")
         hist = ticker.history(start=from_date_str, end=to_date_str)
         if hist.empty:
             return pd.DataFrame()
-        hist = hist.rename(columns={"High": "High", "Low": "Low", "Volume": "Volume"})
-        return hist[["High", "Low", "Volume"]]
+        return hist[["High", "Low", "Close", "Volume"]]
     except Exception:
         return pd.DataFrame()
 
@@ -126,9 +126,9 @@ def fetch_jquants_history(code, from_date_str, to_date_str, api_key):
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").set_index("Date")
 
-    # 調整済み高値・安値・出来高（AdjH/AdjL/AdjVo）を使用。取引が無い日はNULLなので除外。
-    df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjVo": "Volume"})
-    keep_cols = [c for c in ["High", "Low", "Volume"] if c in df.columns]
+    # 調整済み高値・安値・終値・出来高（AdjH/AdjL/AdjC/AdjVo）を使用。取引が無い日はNULLなので除外。
+    df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"})
+    keep_cols = [c for c in ["High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[keep_cols].dropna(how="all")
     return df
 
@@ -146,12 +146,13 @@ def get_price_history(code, from_dt, to_dt, source, api_key=None):
 # スクリーニング条件の判定
 # ============================================================
 
-def screen_code(code, min_avg_volume, lookback_days, source, api_key=None):
+def screen_code(code, min_avg_volume, lookback_days, decline_threshold_pct, source, api_key=None):
     """
-    1銘柄に対して「年初来安値更新」かつ「直近N日平均出来高が下限以上」を判定する。
-    出来高フィルターは市場区分・業種で絞り込んだ銘柄を対象に、
-    年初来安値をスクリーニングするための足切り条件として常に適用する。
-    両方を満たした場合のみ結果を返す。
+    1銘柄に対して以下をすべて満たすかを判定する：
+      1. 直近N日平均出来高が下限以上（足切り条件）
+      2. 当日の安値が年初来安値を更新している
+      3. 年初来高値から現在値（終値）までの下落率が約decline_threshold_pct%以上
+    すべて満たした場合のみ結果を返す。
     """
     today = date.today()
     jan1 = date(today.year, 1, 1)
@@ -180,7 +181,18 @@ def screen_code(code, min_avg_volume, lookback_days, source, api_key=None):
     if latest_low > ytd_low:
         return None
 
-    return {"code": code, "avg_volume": avg_volume}
+    # 3. 年初来高値からの下落率の条件
+    if 'Close' not in ytd_hist.columns:
+        return None
+    ytd_high = ytd_hist['High'].max()
+    latest_close = ytd_hist['Close'].iloc[-1]
+    if pd.isna(ytd_high) or pd.isna(latest_close) or ytd_high <= 0:
+        return None
+    decline_pct = (ytd_high - latest_close) / ytd_high * 100
+    if decline_pct < decline_threshold_pct:
+        return None
+
+    return {"code": code, "avg_volume": avg_volume, "decline_pct": decline_pct}
 
 
 def send_discord_notify(msg):
@@ -309,12 +321,14 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. スクリーニング条件（固定）：出来高（足切り条件） × 年初来安値更新
-    st.markdown("###### 📉 スクリーニング条件（年初来安値更新）")
+    # 2. スクリーニング条件（固定）：出来高（足切り条件） × 年初来安値更新 × 下落率
+    st.markdown("###### 📉 スクリーニング条件（年初来安値更新・急落銘柄）")
     st.caption(
         f"市場区分・業種で絞り込んだ銘柄のうち、直近{LOOKBACK_DAYS}日間の平均出来高が"
         f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、"
-        "「当日の安値が年初来安値を更新」しているかをスクリーニングします（条件は固定です）。"
+        "「当日の安値が年初来安値を更新」し、かつ"
+        f"「年初来高値から現在値までの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上」の銘柄をスクリーニングします"
+        "（条件は固定です）。"
     )
 
     st.markdown("")
@@ -357,6 +371,7 @@ with tab_screen:
                             code,
                             MIN_AVG_VOLUME,
                             LOOKBACK_DAYS,
+                            DECLINE_THRESHOLD_PCT,
                             st.session_state.data_source,
                             jquants_api_key,
                         ): code
@@ -386,12 +401,17 @@ with tab_screen:
                         "業種": row['33業種区分'],
                         "規模カテゴリ": row['規模カテゴリ'] if '規模カテゴリ' in row.index else None,
                         "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
+                        "下落率 (%)": round(res["decline_pct"], 1) if res.get("decline_pct") is not None else "-",
                     })
 
                 # Discord通知はスクリーニング実行時（このタイミング）だけ送る
                 for res in final_results:
                     vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
-                    msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n平均出来高: {vol_text}"
+                    decline_text = f"{res['下落率 (%)']}%" if res['下落率 (%)'] != "-" else "-"
+                    msg = (
+                        f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n"
+                        f"平均出来高: {vol_text} ｜ 年初来高値からの下落率: {decline_text}"
+                    )
                     send_discord_notify(msg)
 
                 # 規模フィルターの切替（st.radio等）で再実行されても結果を保持できるようセッションに保存
@@ -435,10 +455,12 @@ with tab_screen:
 
             for res in display_results:
                 vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
+                decline_text = f"{res['下落率 (%)']}%" if res.get('下落率 (%)', "-") != "-" else "-"
                 caption_parts = [f"市場: {res['市場']}", f"業種: {res['業種']}"]
                 if res.get("規模カテゴリ"):
                     caption_parts.append(f"規模: {res['規模カテゴリ']}")
                 caption_parts.append(f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}")
+                caption_parts.append(f"年初来高値からの下落率: {decline_text}")
 
                 render_company_card(
                     res["会社名"],
