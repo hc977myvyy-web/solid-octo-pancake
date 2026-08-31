@@ -26,7 +26,6 @@ DECLINE_LOOKBACK_DAYS = 92  # 「直近3ヶ月」の目安（暦日ベース）
 # --- ページ設定 ---
 st.set_page_config(
     page_title="株式スクリーニングツール",
-    page_icon="📈",
     layout="wide",
 )
 
