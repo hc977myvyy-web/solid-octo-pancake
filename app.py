@@ -16,12 +16,16 @@ if "use_ytd_low" not in st.session_state:
     st.session_state.use_ytd_low = True
 if "use_decline" not in st.session_state:
     st.session_state.use_decline = True
+if "use_ore_teki" not in st.session_state:
+    st.session_state.use_ore_teki = False
 
 # --- スクリーニング条件（固定値） ---
 LOOKBACK_DAYS = 20
 MIN_AVG_VOLUME = 10000
 DECLINE_THRESHOLD_PCT = 20.0  # 直近3ヶ月の高値からの下落率（約20%以上）
 DECLINE_LOOKBACK_DAYS = 92  # 「直近3ヶ月」の目安（暦日ベース）
+ORE_TEKI_PRICE_MIN = 1000.0  # 「俺的株」の株価下限（円）
+ORE_TEKI_PRICE_MAX = 2000.0  # 「俺的株」の株価上限（円）
 
 # --- ページ設定 ---
 st.set_page_config(
@@ -164,6 +168,9 @@ def screen_code(
     decline_lookback_days,
     use_ytd_low,
     use_decline,
+    use_ore_teki,
+    price_min,
+    price_max,
     source,
     api_key=None,
 ):
@@ -171,10 +178,12 @@ def screen_code(
     1銘柄に対して以下を判定する：
       1. 直近N日平均出来高が下限以上（常に適用する足切り条件）
       2. use_ytd_low が True の場合のみ：当日の安値が年初来安値を更新しているか
-      3. use_decline が True の場合のみ：直近decline_lookback_days日間の高値から
+      3. use_decline または use_ore_teki が True の場合：直近decline_lookback_days日間の高値から
          現在値（終値）までの下落率が約decline_threshold_pct%以上か
-    2・3は互いに独立した条件で、チェックが入っているものだけを判定に使う
-    （両方チェックされていればAND条件になる）。
+      4. use_ore_teki が True の場合のみ：現在値（終値）がprice_min〜price_max円の範囲内か
+         （「俺的株」＝下落率条件を満たし、かつ買いやすい価格帯の銘柄）
+    2・3・4は互いに独立した条件で、チェックが入っているものだけを判定に使う
+    （複数チェックされていればAND条件になる）。
     """
     today = date.today()
     jan1 = date(today.year, 1, 1)
@@ -182,10 +191,13 @@ def screen_code(
     # 出来高判定用に土日・祝日を考慮して少し多めに取得する
     volume_from = today - timedelta(days=int(lookback_days * 2.5) + 10)
 
+    # 「俺的株」は下落率条件を内包するため、どちらかがチェックされていれば下落率データを取得する
+    need_decline_data = use_decline or use_ore_teki
+
     from_candidates = [volume_from]
     if use_ytd_low:
         from_candidates.append(jan1)
-    if use_decline:
+    if need_decline_data:
         from_candidates.append(decline_from)
     from_dt = min(from_candidates)
 
@@ -203,6 +215,7 @@ def screen_code(
 
     ytd_low_hit = None
     decline_pct = None
+    latest_close = None
 
     # 2. 年初来安値更新の条件
     if use_ytd_low:
@@ -215,8 +228,8 @@ def screen_code(
         if not ytd_low_hit:
             return None
 
-    # 3. 直近3ヶ月の高値からの下落率の条件
-    if use_decline:
+    # 3. 直近3ヶ月の高値からの下落率の条件（use_decline / use_ore_teki 共通）
+    if need_decline_data:
         if 'Close' not in hist.columns:
             return None
         recent_hist = hist[hist.index.date >= decline_from]
@@ -230,11 +243,21 @@ def screen_code(
         if decline_pct < decline_threshold_pct:
             return None
 
+    # 4. 「俺的株」の株価レンジ条件
+    if use_ore_teki:
+        if latest_close is None:
+            if 'Close' not in hist.columns:
+                return None
+            latest_close = hist['Close'].iloc[-1]
+        if pd.isna(latest_close) or not (price_min <= latest_close <= price_max):
+            return None
+
     return {
         "code": code,
         "avg_volume": avg_volume,
         "ytd_low_hit": ytd_low_hit,
         "decline_pct": decline_pct,
+        "latest_close": latest_close,
     }
 
 
@@ -364,12 +387,8 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. スクリーニング条件：出来高（常時足切り） × 年初来安値更新／下落率（それぞれON/OFF可能）
+    # 2. スクリーニング条件：出来高（常時足切り） × 年初来安値更新／下落率／俺的株（それぞれON/OFF可能）
     st.markdown("###### 📉 スクリーニング条件")
-    st.caption(
-        f"市場区分・業種で絞り込んだ銘柄のうち、直近{LOOKBACK_DAYS}日間の平均出来高が"
-        f"{MIN_AVG_VOLUME:,}株以上の銘柄を対象に、下記でチェックした条件（AND）でスクリーニングします。"
-    )
     c1, c2 = st.columns(2)
     with c1:
         st.session_state.use_ytd_low = st.checkbox(
@@ -381,6 +400,11 @@ with st.container(border=True):
             f"直近3ヶ月の高値からの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上",
             value=st.session_state.use_decline,
         )
+    st.session_state.use_ore_teki = st.checkbox(
+        f"🎯 俺的株（下落率約{DECLINE_THRESHOLD_PCT:.0f}%以上 かつ 株価"
+        f"{ORE_TEKI_PRICE_MIN:,.0f}〜{ORE_TEKI_PRICE_MAX:,.0f}円で買いやすいもの）",
+        value=st.session_state.use_ore_teki,
+    )
 
     st.markdown("")
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
@@ -395,8 +419,8 @@ with tab_screen:
     if search_btn and not df_jpx.empty:
         if st.session_state.data_source == "J-Quants" and not jquants_api_key:
             st.error("J-Quantsを選択している場合はAPIキーが必要です。サイドバーから入力してください。")
-        elif not st.session_state.use_ytd_low and not st.session_state.use_decline:
-            st.warning("⚠️ 「年初来安値更新」「下落率」のいずれか1つ以上にチェックを入れてください。")
+        elif not st.session_state.use_ytd_low and not st.session_state.use_decline and not st.session_state.use_ore_teki:
+            st.warning("⚠️ 「年初来安値更新」「下落率」「俺的株」のいずれか1つ以上にチェックを入れてください。")
         else:
             target_df = df_jpx.copy()
 
@@ -428,6 +452,9 @@ with tab_screen:
                             DECLINE_LOOKBACK_DAYS,
                             st.session_state.use_ytd_low,
                             st.session_state.use_decline,
+                            st.session_state.use_ore_teki,
+                            ORE_TEKI_PRICE_MIN,
+                            ORE_TEKI_PRICE_MAX,
                             st.session_state.data_source,
                             jquants_api_key,
                         ): code
@@ -459,6 +486,7 @@ with tab_screen:
                         "平均出来高 (株)": int(round(res["avg_volume"])) if res["avg_volume"] is not None else "-",
                         "年初来安値更新": res.get("ytd_low_hit"),
                         "下落率 (%)": round(res["decline_pct"], 1) if res.get("decline_pct") is not None else "-",
+                        "現在値 (円)": round(res["latest_close"], 1) if res.get("latest_close") is not None else "-",
                     })
 
                 # Discord通知はスクリーニング実行時（このタイミング）だけ送る
@@ -469,6 +497,8 @@ with tab_screen:
                         parts.append("年初来安値更新: 該当")
                     if res['下落率 (%)'] != "-":
                         parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
+                    if res['現在値 (円)'] != "-":
+                        parts.append(f"現在値: {res['現在値 (円)']}円")
                     msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n" + " ｜ ".join(parts)
                     send_discord_notify(msg)
 
@@ -478,6 +508,7 @@ with tab_screen:
                 st.session_state.last_screen_conditions = (
                     st.session_state.use_ytd_low,
                     st.session_state.use_decline,
+                    st.session_state.use_ore_teki,
                 )
 
     # --- スクリーニング結果の表示（規模フィルター含む） ---
@@ -515,9 +546,15 @@ with tab_screen:
                     display_results = [r for r in final_results if r.get("規模カテゴリ") == target_size]
                 st.caption(f"表示件数: {len(display_results)}件")
 
-            used_ytd_low, used_decline = st.session_state.get("last_screen_conditions", (True, True))
+            used_ytd_low, used_decline, used_ore_teki = st.session_state.get(
+                "last_screen_conditions", (True, True, False)
+            )
 
-            for res in display_results:
+            # 業種ごとにグループ化して表示（業種名でソート、銘柄が多い場合も見やすいようexpanderでまとめる）
+            sectors = sorted({r["業種"] for r in display_results if r.get("業種")})
+            group_by_sector = st.checkbox("🏭 業種ごとにグループ表示する", value=True, key="screen_group_by_sector")
+
+            def render_result_card(res):
                 vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
                 caption_parts = [f"市場: {res['市場']}", f"業種: {res['業種']}"]
                 if res.get("規模カテゴリ"):
@@ -525,8 +562,10 @@ with tab_screen:
                 caption_parts.append(f"直近{LOOKBACK_DAYS}日平均出来高: {vol_text}")
                 if used_ytd_low:
                     caption_parts.append("年初来安値更新: 該当")
-                if used_decline and res.get('下落率 (%)', "-") != "-":
+                if (used_decline or used_ore_teki) and res.get('下落率 (%)', "-") != "-":
                     caption_parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
+                if used_ore_teki and res.get('現在値 (円)', "-") != "-":
+                    caption_parts.append(f"現在値: {res['現在値 (円)']}円（俺的株）")
 
                 render_company_card(
                     res["会社名"],
@@ -534,6 +573,16 @@ with tab_screen:
                     key_prefix="screen",
                     caption_parts=caption_parts,
                 )
+
+            if group_by_sector and sectors:
+                for sector in sectors:
+                    sector_results = [r for r in display_results if r.get("業種") == sector]
+                    with st.expander(f"🏭 {sector}（{len(sector_results)}件）", expanded=True):
+                        for res in sector_results:
+                            render_result_card(res)
+            else:
+                for res in display_results:
+                    render_result_card(res)
         else:
             st.warning("⚠️ 指定した条件をクリアした銘柄はありませんでした。")
     elif not search_btn:
