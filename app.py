@@ -99,6 +99,27 @@ def fetch_yfinance_history(code, from_date_str, to_date_str):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def fetch_per_yfinance(code):
+    """
+    PER（株価収益率）をyfinanceから取得する。
+    J-Quants Lightプランには財務指標（PER等）が含まれないため、
+    出来高・株価はJ-Quants、PERだけyfinanceから補完する形にしている。
+    """
+    try:
+        ticker = yf.Ticker(f"{code}.T")
+        info = ticker.info
+        per = info.get('trailingPE') or info.get('forwardPE')
+        if not per:
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+            eps = info.get('trailingEps') or info.get('forwardEps')
+            if current_price and eps and eps > 0:
+                per = current_price / eps
+        return per
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_jquants_history(code, from_date_str, to_date_str, api_key):
     """
     J-Quants API v2 (/v2/equities/bars/daily) から日足データを取得する。
@@ -358,7 +379,8 @@ if st.session_state.data_source == "J-Quants":
             st.sidebar.warning("APIキーが未入力のため、J-Quantsでのデータ取得はできません。")
 
 st.sidebar.caption(
-    "※ J-QuantsのFreeプランはデータに遅延があります。プランによって取得できる期間や項目が異なります。"
+    "※ 同時実行数はLightプラン（60req/分）を想定した設定です。Freeプランのままだとレートリミットに"
+    "引っかかりやすいのでご注意ください。"
 )
 
 # --- メイン画面：フィルターバー ---
@@ -439,7 +461,8 @@ with tab_screen:
                 screen_results = []
 
                 # J-Quantsはレートリミットがあるため同時実行数を抑える
-                max_workers = 3 if st.session_state.data_source == "J-Quants" else 6
+                # （Freeプラン:5req/分想定で3並列、Light以上:60req/分想定で10並列）
+                max_workers = 10 if st.session_state.data_source == "J-Quants" else 6
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {
@@ -489,6 +512,22 @@ with tab_screen:
                         "現在値 (円)": round(res["latest_close"], 1) if res.get("latest_close") is not None else "-",
                     })
 
+                # PERはJ-Quants Lightに含まれないためyfinanceから補完取得する（結果件数分だけなので軽量）
+                if final_results:
+                    with st.spinner("PER（yfinance）を取得中..."):
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as per_executor:
+                            per_futures = {
+                                per_executor.submit(fetch_per_yfinance, r["コード"]): r["コード"]
+                                for r in final_results
+                            }
+                            per_map = {}
+                            for future in concurrent.futures.as_completed(per_futures):
+                                code = per_futures[future]
+                                per_map[code] = future.result()
+                    for r in final_results:
+                        per_val = per_map.get(r["コード"])
+                        r["PER (倍)"] = round(per_val, 2) if per_val else "-"
+
                 # Discord通知はスクリーニング実行時（このタイミング）だけ送る
                 for res in final_results:
                     vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
@@ -499,6 +538,8 @@ with tab_screen:
                         parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
                     if res['現在値 (円)'] != "-":
                         parts.append(f"現在値: {res['現在値 (円)']}円")
+                    if res.get('PER (倍)', "-") != "-":
+                        parts.append(f"PER: {res['PER (倍)']}倍")
                     msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n" + " ｜ ".join(parts)
                     send_discord_notify(msg)
 
@@ -566,6 +607,8 @@ with tab_screen:
                     caption_parts.append(f"直近3ヶ月高値からの下落率: {res['下落率 (%)']}%")
                 if used_ore_teki and res.get('現在値 (円)', "-") != "-":
                     caption_parts.append(f"現在値: {res['現在値 (円)']}円（俺的株）")
+                if res.get('PER (倍)', "-") != "-":
+                    caption_parts.append(f"PER: {res['PER (倍)']}倍")
 
                 render_company_card(
                     res["会社名"],
@@ -636,6 +679,9 @@ with tab_list:
                                 )
                                 if avg_vol is not None and not pd.isna(avg_vol):
                                     st.markdown(f"📊 **直近20日間の平均出来高:** {int(round(avg_vol)):,}株")
+
+                                per_val = fetch_per_yfinance(code)
+                                st.markdown(f"💰 **PER:** {round(per_val, 2) if per_val else '-'} 倍（yfinance）")
                             else:
                                 st.markdown("📊 データを取得できませんでした。")
             else:
@@ -672,15 +718,38 @@ with tab_list:
             if len(size_df) > 50:
                 st.caption("※ 先頭50件を表示しています。銘柄名で絞り込むと目的の銘柄を見つけやすくなります。")
 
+            show_per = st.checkbox(
+                "💰 PERも表示する（yfinanceから取得・表示に少し時間がかかります）",
+                value=False,
+                key=f"sizelist_show_per_{size_label_map[size_option]}",
+            )
+            per_map = {}
+            if show_per and not display_df.empty:
+                with st.spinner("PERを取得中..."):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as per_executor:
+                        codes_in_view = display_df['コード'].astype(str).tolist()
+                        per_futures = {
+                            per_executor.submit(fetch_per_yfinance, c): c for c in codes_in_view
+                        }
+                        for future in concurrent.futures.as_completed(per_futures):
+                            c = per_futures[future]
+                            per_map[c] = future.result()
+
             for _, row in display_df.iterrows():
+                code_str = str(row['コード'])
+                caption_parts = [
+                    f"市場: {row['市場・商品区分']}",
+                    f"業種: {row['33業種区分']}",
+                ]
+                if show_per:
+                    per_val = per_map.get(code_str)
+                    caption_parts.append(f"PER: {round(per_val, 2) if per_val else '-'} 倍")
+
                 render_company_card(
                     row['銘柄名'],
-                    str(row['コード']),
+                    code_str,
                     key_prefix=f"sizelist_{size_label_map[size_option]}",
-                    caption_parts=[
-                        f"市場: {row['市場・商品区分']}",
-                        f"業種: {row['33業種区分']}",
-                    ],
+                    caption_parts=caption_parts,
                 )
         else:
             st.warning(
