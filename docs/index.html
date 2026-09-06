@@ -1,12 +1,108 @@
-リポジトリ/
-├── streamlit_app.py       
-├── requirements.txt       
-└── docs/
-    ├── index.html
-    ├── manifest.json
-    ├── sw.js
-    ├── icon-192.png
-    ├── icon-512.png
-    ├── icon-maskable-512.png
-    ├── apple-touch-icon.png
-    └── make_icons.py
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+<!-- ▼▼▼ ここだけ書き換えてください ▼▼▼ -->
+<title>マイアプリ</title>
+<meta name="theme-color" content="#1f3a5f">
+<script>
+  var APP_URL = "https://solid-octo-pancake-bqnfogjononcruhugfusn3.streamlit.app/?embed=true";
+</script>
+<!-- ▲▲▲ ここまで ▲▲▲ -->
+
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+<style>
+  :root { color-scheme: light; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1f3a5f;
+    overflow: hidden;
+  }
+  #app {
+    position: fixed;
+    inset: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    box-sizing: border-box;
+    background: #fff;
+  }
+  #app iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+  }
+  #waking {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-content: center;
+    gap: 1.25rem;
+    justify-items: center;
+    background: #1f3a5f;
+    color: #eaf0f7;
+    font: 400 1rem/1.6 system-ui, -apple-system, "Hiragino Kaku Gothic ProN", sans-serif;
+    text-align: center;
+    padding: 2rem;
+    transition: opacity .4s ease;
+  }
+  #waking[hidden] { display: none; }
+  #waking.done { opacity: 0; pointer-events: none; }
+  .pulse {
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 50%;
+    background: #eaf0f7;
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(.7); opacity: .35; }
+    50%      { transform: scale(1);  opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pulse { animation: none; opacity: .8; }
+  }
+  #waking p { margin: 0; max-width: 22rem; }
+  #waking .sub { font-size: .875rem; color: #a9bcd2; }
+</style>
+</head>
+<body>
+
+<div id="waking">
+  <div class="pulse"></div>
+  <p>アプリを起動しています</p>
+  <p class="sub">しばらく使っていなかった場合、最初の起動に30秒ほどかかります。</p>
+</div>
+
+<div id="app"></div>
+
+<script>
+  var frame = document.createElement("iframe");
+  frame.src = APP_URL;
+  frame.allow = "clipboard-write; camera; microphone; geolocation";
+  frame.setAttribute("allowfullscreen", "");
+  frame.addEventListener("load", function () {
+    var waking = document.getElementById("waking");
+    waking.classList.add("done");
+    setTimeout(function () { waking.hidden = true; }, 400);
+  });
+  document.getElementById("app").appendChild(frame);
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js");
+    });
+  }
+</script>
+
+</body>
+</html>
