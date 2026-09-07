@@ -737,7 +737,11 @@ else:
 # メイン
 # ============================================================
 
-st.title("📈 株価スクリーニング")
+st.markdown(
+    "<h1 style='font-size:1.5rem; white-space:nowrap;'>📈 株価スクリーニング</h1>",
+    unsafe_allow_html=True,
+)
+
 
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
