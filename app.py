@@ -1,3 +1,5 @@
+import time
+import threading
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -18,6 +20,8 @@ if "use_decline" not in st.session_state:
     st.session_state.use_decline = True
 if "use_ore_teki" not in st.session_state:
     st.session_state.use_ore_teki = False
+if "exclude_today" not in st.session_state:
+    st.session_state.exclude_today = True
 
 # --- スクリーニング条件（固定値） ---
 LOOKBACK_DAYS = 20
@@ -47,6 +51,58 @@ except Exception:
     JQUANTS_API_KEY_SECRET = ""
 
 JQUANTS_BASE_URL = "https://api.jquants.com/v2"
+
+# Lightプランのレートリミットは 60 リクエスト/分。
+# 大幅に超過すると5分程度アクセスが完全に遮断されるため、余裕をもって抑える。
+JQ_RATE_LIMIT_PER_MIN = 55
+JQ_MAX_WORKERS = 4  # 実効速度はレートリミッタで決まるので同時実行数は控えめでよい
+
+
+# ============================================================
+# 共通ユーティリティ
+# ============================================================
+
+def normalize_code(value):
+    """
+    data_j.xls の「コード」列を文字列コードに正規化する。
+    Excel読み込み時に float 化されて '1301.0' になるケースと、
+    英文字入り証券コード（例: '130A'）の両方に対応する。
+    """
+    if pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def to_4digit(code5):
+    """
+    J-Quantsの5桁コード（例: '86970'）を data_j.xls の4桁コード（'8697'）に変換する。
+    末尾が '0' でないものは優先株・優先出資証券等なので除外する（None を返す）。
+    """
+    s = str(code5)
+    if len(s) == 5 and s.endswith("0"):
+        return s[:4]
+    return None
+
+
+class RateLimiter:
+    """プロセス全体で1分あたりのリクエスト数を平準化する簡易リミッタ。"""
+
+    def __init__(self, max_per_min):
+        self.interval = 60.0 / float(max_per_min)
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_at - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self._next_at = max(now, self._next_at) + self.interval
 
 
 def classify_size(scale_label):
@@ -82,28 +138,45 @@ def load_jpx_data():
 
 
 # ============================================================
-# データ取得レイヤー（yfinance / J-Quants を切り替え可能にする）
+# データ取得レイヤー（yfinance / J-Quants）
 # ============================================================
+
+def fetch_yfinance_history_raw(code, from_date_str, to_date_str):
+    """
+    yfinanceから日足データ（High, Low, Close, Volume）を取得する。
+
+    auto_adjust=False を明示している点が重要。
+    - auto_adjust=True（新しめのyfinanceのデフォルト）だと配当込みで遡及調整された値になる
+    - J-Quantsの調整は株式分割・併合・ライツイシューのみで、配当は対象外
+    auto_adjust=False の場合、Yahooの High/Low/Close は分割調整済み・配当未調整なので、
+    J-Quantsの AdjH/AdjL/AdjC と調整の意味が揃う。
+    """
+    try:
+        ticker = yf.Ticker(f"{code}.T")
+        # yfinanceの end は排他的なので、to_date当日を含めるため +1日する
+        end_exclusive = (pd.to_datetime(to_date_str) + timedelta(days=1)).strftime("%Y-%m-%d")
+        hist = ticker.history(start=from_date_str, end=end_exclusive, auto_adjust=False)
+        if hist.empty:
+            return pd.DataFrame()
+        hist = hist[["High", "Low", "Close", "Volume"]].copy()
+        hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
+        return hist
+    except Exception:
+        return pd.DataFrame()
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yfinance_history(code, from_date_str, to_date_str):
-    """yfinanceから日足データ（High, Low, Close, Volume）を取得する"""
-    try:
-        ticker = yf.Ticker(f"{code}.T")
-        hist = ticker.history(start=from_date_str, end=to_date_str)
-        if hist.empty:
-            return pd.DataFrame()
-        return hist[["High", "Low", "Close", "Volume"]]
-    except Exception:
-        return pd.DataFrame()
+    return fetch_yfinance_history_raw(code, from_date_str, to_date_str)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_per_yfinance(code):
     """
     PER（株価収益率）をyfinanceから取得する。
-    J-Quants Lightプランには財務指標（PER等）が含まれないため、
-    出来高・株価はJ-Quants、PERだけyfinanceから補完する形にしている。
+    ※ J-Quants Lightプランでも財務情報（/fins/summary）は取得できるため、
+      本来はJ-Quants側のEPSと時価総額（日足のMktCap列）から自前計算もできる。
+      ここでは変更範囲を絞るため従来どおりyfinanceから取得している。
     """
     try:
         ticker = yf.Ticker(f"{code}.T")
@@ -119,70 +192,188 @@ def fetch_per_yfinance(code):
         return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_jquants_history(code, from_date_str, to_date_str, api_key):
+def jq_request(path, params, api_key, limiter, errors, max_retries=4):
     """
-    J-Quants API v2 (/v2/equities/bars/daily) から日足データを取得する。
-    認証はダッシュボードで発行したAPIキーを x-api-key ヘッダーに付与する方式。
-    pagination_key が返る場合は続きのページを取得する。
-    """
-    if not api_key:
-        return pd.DataFrame()
+    J-Quants API v2 への1リクエスト（pagination_key があれば続きも取得）。
 
-    url = f"{JQUANTS_BASE_URL}/equities/bars/daily"
+    旧実装との違い：
+      - 非200を黙って握り潰さず errors に積む（原因が画面に出るようになる）
+      - 429 はバックオフしてリトライする
+      - 全リクエストを RateLimiter で平準化する
+    """
+    url = JQUANTS_BASE_URL + path
     headers = {"x-api-key": api_key}
-    params = {"code": code, "from": from_date_str, "to": to_date_str}
-
+    params = dict(params)
     records = []
     pagination_key = None
-    try:
-        while True:
-            if pagination_key:
-                params["pagination_key"] = pagination_key
-            res = requests.get(url, headers=headers, params=params, timeout=10)
-            if res.status_code != 200:
-                # 認証エラー・レートリミット等はここで打ち切る
-                break
-            payload = res.json()
-            records.extend(payload.get("data", []))
-            pagination_key = payload.get("pagination_key")
-            if not pagination_key:
-                break
-    except Exception:
-        pass
 
+    while True:
+        if pagination_key:
+            params["pagination_key"] = pagination_key
+
+        res = None
+        for attempt in range(max_retries):
+            limiter.acquire()
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=30)
+            except Exception as e:
+                errors.append(f"{path} {params.get('date') or params.get('code')}: 通信エラー {e}")
+                return records
+
+            if res.status_code == 200:
+                break
+            if res.status_code == 429:
+                # レートリミット超過。J-Quantsはリセットが長めなので線形に待つ。
+                time.sleep(30 * (attempt + 1))
+                res = None
+                continue
+            errors.append(
+                f"{path} {params.get('date') or params.get('code')}: "
+                f"HTTP {res.status_code} {res.text[:200]}"
+            )
+            return records
+
+        if res is None:
+            errors.append(f"{path} {params.get('date') or params.get('code')}: 429が続いたため中断")
+            return records
+
+        payload = res.json()
+        records.extend(payload.get("data", []))
+        pagination_key = payload.get("pagination_key")
+        if not pagination_key:
+            break
+
+    return records
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
+    """
+    指定期間の「全上場銘柄」の日足を、日付ごとに一括取得する。
+
+    ここが今回の最大の修正点。
+    /equities/bars/daily は date だけ指定すれば全上場銘柄が1リクエストで取れる。
+    銘柄コードごとに叩くと約4000リクエストになり、Lightの60req/分では
+    確実に429で全滅する（=結果が0件になる）。
+    日付ループなら年初来でも約170リクエストで済む。
+
+    戻り値: ({4桁コード: 日足DataFrame}, エラーのリスト)
+    """
+    if not api_key:
+        return {}, ["APIキーが設定されていません。"]
+
+    # 土日は最初から除外する（祝日は空レスポンスが返るだけなので許容）
+    dates = pd.bdate_range(from_date_str, to_date_str)
+    if len(dates) == 0:
+        return {}, []
+
+    limiter = RateLimiter(JQ_RATE_LIMIT_PER_MIN)
+    errors = []
+    all_records = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JQ_MAX_WORKERS) as ex:
+        futures = [
+            ex.submit(
+                jq_request,
+                "/equities/bars/daily",
+                {"date": d.strftime("%Y-%m-%d")},
+                api_key,
+                limiter,
+                errors,
+            )
+            for d in dates
+        ]
+        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+            all_records.extend(fut.result())
+            if _progress:
+                _progress((i + 1) / len(futures), i + 1, len(futures))
+
+    if not all_records:
+        return {}, errors
+
+    df = pd.DataFrame(all_records)
+    if "Date" not in df.columns or "Code" not in df.columns:
+        errors.append("レスポンスに Date / Code 列がありません。API仕様を確認してください。")
+        return {}, errors
+
+    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+    df["Code4"] = df["Code"].astype(str).map(to_4digit)
+    df = df[df["Code4"].notna()]
+
+    # 調整済み（分割・併合・ライツイシュー調整）の High / Low / Close / Volume を使う
+    df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"})
+    need = ["Date", "Code4", "High", "Low", "Close", "Volume"]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        errors.append(f"レスポンスに必要な列がありません: {missing}")
+        return {}, errors
+
+    df = df[need].sort_values("Date")
+
+    panel = {}
+    for code4, g in df.groupby("Code4", sort=False):
+        panel[code4] = g.set_index("Date")[["High", "Low", "Close", "Volume"]]
+
+    return panel, errors
+
+
+def fetch_jquants_single(code, from_date_str, to_date_str, api_key):
+    """単一銘柄の日足（全銘柄一覧タブの個別検索用。1リクエストなので code 指定でよい）。"""
+    limiter = RateLimiter(JQ_RATE_LIMIT_PER_MIN)
+    errors = []
+    records = jq_request(
+        "/equities/bars/daily",
+        {"code": code, "from": from_date_str, "to": to_date_str},
+        api_key,
+        limiter,
+        errors,
+    )
+    if errors:
+        st.warning(" / ".join(errors[:3]))
     if not records:
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    if df.empty or "Date" not in df.columns:
+    if "Date" not in df.columns:
         return pd.DataFrame()
-
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
     df = df.sort_values("Date").set_index("Date")
-
-    # 調整済み高値・安値・終値・出来高（AdjH/AdjL/AdjC/AdjVo）を使用。取引が無い日はNULLなので除外。
     df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"})
-    keep_cols = [c for c in ["High", "Low", "Close", "Volume"] if c in df.columns]
-    df = df[keep_cols].dropna(how="all")
-    return df
+    keep = [c for c in ["High", "Low", "Close", "Volume"] if c in df.columns]
+    return df[keep]
 
 
-def get_price_history(code, from_dt, to_dt, source, api_key=None):
-    from_str = from_dt.strftime("%Y-%m-%d")
-    to_str = to_dt.strftime("%Y-%m-%d")
-    if source == "J-Quants":
-        return fetch_jquants_history(code, from_str, to_str, api_key)
-    else:
-        return fetch_yfinance_history(code, from_str, to_str)
+def trim_today(hist, exclude_today):
+    """
+    当日分を落とす。
+    J-Quantsの日足は大引け後に更新されるのに対し、yfinanceは場中の途中経過が入る。
+    これを揃えないと「年初来安値更新」の判定が両者で食い違う。
+    """
+    if not exclude_today or hist is None or hist.empty:
+        return hist
+    today_ts = pd.Timestamp(date.today())
+    return hist[hist.index < today_ts]
 
 
 # ============================================================
 # スクリーニング条件の判定
 # ============================================================
 
-def screen_code(
+def compute_from_date(lookback_days, decline_lookback_days, use_ytd_low, need_decline_data):
+    """全銘柄で共通の取得開始日を決める（従来は銘柄ごとに計算していた）。"""
+    today = date.today()
+    jan1 = date(today.year, 1, 1)
+    from_candidates = [today - timedelta(days=int(lookback_days * 2.5) + 10)]
+    if use_ytd_low:
+        from_candidates.append(jan1)
+    if need_decline_data:
+        from_candidates.append(today - timedelta(days=decline_lookback_days))
+    return min(from_candidates)
+
+
+def screen_hist(
     code,
+    hist,
     min_avg_volume,
     lookback_days,
     decline_threshold_pct,
@@ -192,45 +383,27 @@ def screen_code(
     use_ore_teki,
     price_min,
     price_max,
-    source,
-    api_key=None,
 ):
     """
-    1銘柄に対して以下を判定する：
+    取得済みの日足に対して条件判定する（データ取得と判定を分離した）。
       1. 直近N日平均出来高が下限以上（常に適用する足切り条件）
-      2. use_ytd_low が True の場合のみ：当日の安値が年初来安値を更新しているか
-      3. use_decline または use_ore_teki が True の場合：直近decline_lookback_days日間の高値から
-         現在値（終値）までの下落率が約decline_threshold_pct%以上か
-      4. use_ore_teki が True の場合のみ：現在値（終値）がprice_min〜price_max円の範囲内か
-         （「俺的株」＝下落率条件を満たし、かつ買いやすい価格帯の銘柄）
-    2・3・4は互いに独立した条件で、チェックが入っているものだけを判定に使う
-    （複数チェックされていればAND条件になる）。
+      2. use_ytd_low: 当日の安値が年初来安値を更新しているか
+      3. use_decline / use_ore_teki: 直近decline_lookback_days日間の高値からの下落率
+      4. use_ore_teki: 現在値がprice_min〜price_max円の範囲内か
     """
+    if hist is None or hist.empty:
+        return None
+
     today = date.today()
     jan1 = date(today.year, 1, 1)
     decline_from = today - timedelta(days=decline_lookback_days)
-    # 出来高判定用に土日・祝日を考慮して少し多めに取得する
-    volume_from = today - timedelta(days=int(lookback_days * 2.5) + 10)
 
-    # 「俺的株」は下落率条件を内包するため、どちらかがチェックされていれば下落率データを取得する
     need_decline_data = use_decline or use_ore_teki
-
-    from_candidates = [volume_from]
-    if use_ytd_low:
-        from_candidates.append(jan1)
-    if need_decline_data:
-        from_candidates.append(decline_from)
-    from_dt = min(from_candidates)
-
-    hist = get_price_history(code, from_dt, today, source, api_key)
-    if hist is None or hist.empty:
-        return None
 
     # 1. 出来高条件（足切り）
     if len(hist) < lookback_days:
         return None
-    recent_vol = hist['Volume'].tail(lookback_days)
-    avg_volume = recent_vol.mean()
+    avg_volume = hist['Volume'].tail(lookback_days).mean()
     if pd.isna(avg_volume) or avg_volume < min_avg_volume:
         return None
 
@@ -245,11 +418,13 @@ def screen_code(
             return None
         ytd_low = ytd_hist['Low'].min()
         latest_low = ytd_hist['Low'].iloc[-1]
+        if pd.isna(ytd_low) or pd.isna(latest_low):
+            return None
         ytd_low_hit = latest_low <= ytd_low
         if not ytd_low_hit:
             return None
 
-    # 3. 直近3ヶ月の高値からの下落率の条件（use_decline / use_ore_teki 共通）
+    # 3. 直近3ヶ月の高値からの下落率の条件
     if need_decline_data:
         if 'Close' not in hist.columns:
             return None
@@ -288,18 +463,6 @@ def send_discord_notify(msg):
 
 
 def tradingview_symbol_url(code):
-    """
-    TradingViewのシンボルページ（日本語版ドメイン）のURL。
-    TradingViewアプリは tradingview.com ドメイン全体をユニバーサルリンクとして
-    登録しているため、Safari/Chromeで直接開けばアプリがあれば自動的にアプリ側が開く。
-    ただし財務情報タブなどサブページはアプリ起動の対象外になる場合があるため、
-    確実にアプリが開くシンボルのトップページに統一している
-    （開いた後にアプリ内の「財務」タブを選ぶと財務情報が見られる）。
-    ※ Streamlitのプレビュー画面やアプリ内ブラウザ（WebView）など、
-      iframe・埋め込みブラウザ内で開いた場合はユニバーサルリンクが機能せず
-      ブラウザ表示になることがある。その場合は一度ブラウザ（Safari/Chrome）で
-      直接アプリを開いてから試すと動作しやすい。
-    """
     return f"https://jp.tradingview.com/symbols/TSE-{code}/"
 
 
@@ -316,11 +479,6 @@ def build_fundamental_prompt(company_name, code):
 
 
 def render_company_card(company_name, code, key_prefix, caption_parts=None):
-    """
-    企業名（TradingView財務ページへのリンク）＋Geminiでのファンダメンタル分析導線をまとめたカードを表示する。
-    key_prefix: 同じコードの銘柄が複数箇所（スクリーニング結果・規模別一覧など）に出ても
-                ウィジェットIDが衝突しないようにするための接頭辞。
-    """
     tv_url = tradingview_symbol_url(code)
     with st.container(border=True):
         st.markdown(
@@ -351,7 +509,7 @@ def render_company_card(company_name, code, key_prefix, caption_parts=None):
 # --- データ読み込み ---
 df_jpx = load_jpx_data()
 if not df_jpx.empty:
-    df_jpx['コード_str'] = df_jpx['コード'].astype(str)
+    df_jpx['コード_str'] = df_jpx['コード'].apply(normalize_code)
     market_options = ["すべて"] + sorted(df_jpx['市場・商品区分'].unique().tolist())
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
 
@@ -378,9 +536,16 @@ if st.session_state.data_source == "J-Quants":
         if not jquants_api_key:
             st.sidebar.warning("APIキーが未入力のため、J-Quantsでのデータ取得はできません。")
 
+st.session_state.exclude_today = st.sidebar.checkbox(
+    "当日分を除外して判定する",
+    value=st.session_state.exclude_today,
+    help="J-Quantsの日足は大引け後に更新されるのに対し、yfinanceは場中の途中経過が入ります。"
+         "両者の結果を揃えたい場合はONにしてください。",
+)
+
 st.sidebar.caption(
-    "※ 同時実行数はLightプラン（60req/分）を想定した設定です。Freeプランのままだとレートリミットに"
-    "引っかかりやすいのでご注意ください。"
+    f"※ J-Quantsは日付指定で全銘柄をまとめて取得します（Lightの60req/分に対し"
+    f"{JQ_RATE_LIMIT_PER_MIN}req/分で平準化）。初回は数分かかりますが、以降は1時間キャッシュされます。"
 )
 
 # --- メイン画面：フィルターバー ---
@@ -390,7 +555,6 @@ st.markdown("条件を設定してスクリーニングを実行するか、全�
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
 
-    # 1. 業種・市場区分フィルター
     f1, f2 = st.columns(2)
     with f1:
         st.session_state.market_filter = st.selectbox(
@@ -409,7 +573,6 @@ with st.container(border=True):
 
     st.markdown("---")
 
-    # 2. スクリーニング条件：出来高（常時足切り） × 年初来安値更新／下落率／俺的株（それぞれON/OFF可能）
     st.markdown("###### 📉 スクリーニング条件")
     c1, c2 = st.columns(2)
     with c1:
@@ -451,44 +614,90 @@ with tab_screen:
             if st.session_state.sector_filter != "すべて":
                 target_df = target_df[target_df['33業種区分'] == st.session_state.sector_filter]
 
-            codes = target_df['コード'].astype(str).tolist()
+            codes = target_df['コード_str'].tolist()
 
             if len(codes) == 0:
                 st.warning("⚠️ 条件に合致する銘柄がありませんでした。")
             else:
-                progress_text = f"銘柄データを解析中（データソース: {st.session_state.data_source}）..."
-                my_bar = st.progress(0, text=progress_text)
+                need_decline_data = st.session_state.use_decline or st.session_state.use_ore_teki
+                from_dt = compute_from_date(
+                    LOOKBACK_DAYS,
+                    DECLINE_LOOKBACK_DAYS,
+                    st.session_state.use_ytd_low,
+                    need_decline_data,
+                )
+                today = date.today()
+                from_str = from_dt.strftime("%Y-%m-%d")
+                to_str = today.strftime("%Y-%m-%d")
+
+                screen_kwargs = dict(
+                    min_avg_volume=MIN_AVG_VOLUME,
+                    lookback_days=LOOKBACK_DAYS,
+                    decline_threshold_pct=DECLINE_THRESHOLD_PCT,
+                    decline_lookback_days=DECLINE_LOOKBACK_DAYS,
+                    use_ytd_low=st.session_state.use_ytd_low,
+                    use_decline=st.session_state.use_decline,
+                    use_ore_teki=st.session_state.use_ore_teki,
+                    price_min=ORE_TEKI_PRICE_MIN,
+                    price_max=ORE_TEKI_PRICE_MAX,
+                )
+
                 screen_results = []
+                fetch_errors = []
 
-                # J-Quantsはレートリミットがあるため同時実行数を抑える
-                # （Freeプラン:5req/分想定で3並列、Light以上:60req/分想定で10並列）
-                max_workers = 10 if st.session_state.data_source == "J-Quants" else 6
+                if st.session_state.data_source == "J-Quants":
+                    progress_text = "J-Quantsから全銘柄の日足を取得中（日付ごとに一括取得）..."
+                    my_bar = st.progress(0, text=progress_text)
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            screen_code,
-                            code,
-                            MIN_AVG_VOLUME,
-                            LOOKBACK_DAYS,
-                            DECLINE_THRESHOLD_PCT,
-                            DECLINE_LOOKBACK_DAYS,
-                            st.session_state.use_ytd_low,
-                            st.session_state.use_decline,
-                            st.session_state.use_ore_teki,
-                            ORE_TEKI_PRICE_MIN,
-                            ORE_TEKI_PRICE_MAX,
-                            st.session_state.data_source,
-                            jquants_api_key,
-                        ): code
-                        for code in codes
-                    }
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        result = future.result()
-                        if result:
-                            screen_results.append(result)
-                        my_bar.progress((i + 1) / len(codes), text=f"{progress_text} ({i+1}/{len(codes)})")
-                my_bar.empty()
+                    def _cb(ratio, done, total):
+                        my_bar.progress(min(ratio, 1.0), text=f"{progress_text} ({done}/{total}営業日)")
+
+                    panel, fetch_errors = fetch_jquants_panel(
+                        from_str, to_str, jquants_api_key, _progress=_cb
+                    )
+                    my_bar.empty()
+
+                    if fetch_errors:
+                        st.error(
+                            "⚠️ J-Quantsの取得で "
+                            f"{len(fetch_errors)}件のエラーが発生しました。結果が不完全な可能性があります。"
+                        )
+                        with st.expander("エラー詳細を表示"):
+                            for e in fetch_errors[:30]:
+                                st.text(e)
+
+                    if not panel:
+                        st.error(
+                            "J-Quantsからデータを取得できませんでした。"
+                            "APIキー・プラン・レートリミットを確認してください。"
+                        )
+                    else:
+                        st.caption(f"取得できた銘柄数: {len(panel)}件")
+                        for code in codes:
+                            hist = trim_today(panel.get(code), st.session_state.exclude_today)
+                            res = screen_hist(code, hist, **screen_kwargs)
+                            if res:
+                                screen_results.append(res)
+                else:
+                    progress_text = "銘柄データを解析中（データソース: yfinance）..."
+                    my_bar = st.progress(0, text=progress_text)
+
+                    def _screen_one(code):
+                        hist = fetch_yfinance_history(code, from_str, to_str)
+                        hist = trim_today(hist, st.session_state.exclude_today)
+                        return screen_hist(code, hist, **screen_kwargs)
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                        futures = {executor.submit(_screen_one, code): code for code in codes}
+                        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                            result = future.result()
+                            if result:
+                                screen_results.append(result)
+                            my_bar.progress(
+                                (i + 1) / len(codes),
+                                text=f"{progress_text} ({i+1}/{len(codes)})",
+                            )
+                    my_bar.empty()
 
                 m1, m2 = st.columns(2)
                 m1.metric("① 対象銘柄数", f"{len(codes)} 件")
@@ -497,7 +706,10 @@ with tab_screen:
                 final_results = []
                 for res in screen_results:
                     code = res["code"]
-                    row = target_df[target_df['コード'].astype(str) == code].iloc[0]
+                    match = target_df[target_df['コード_str'] == code]
+                    if match.empty:
+                        continue
+                    row = match.iloc[0]
                     company_name = row['銘柄名']
 
                     final_results.append({
@@ -512,7 +724,7 @@ with tab_screen:
                         "現在値 (円)": round(res["latest_close"], 1) if res.get("latest_close") is not None else "-",
                     })
 
-                # PERはJ-Quants Lightに含まれないためyfinanceから補完取得する（結果件数分だけなので軽量）
+                # PERは結果件数分だけyfinanceから補完取得する
                 if final_results:
                     with st.spinner("PER（yfinance）を取得中..."):
                         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as per_executor:
@@ -528,7 +740,6 @@ with tab_screen:
                         per_val = per_map.get(r["コード"])
                         r["PER (倍)"] = round(per_val, 2) if per_val else "-"
 
-                # Discord通知はスクリーニング実行時（このタイミング）だけ送る
                 for res in final_results:
                     vol_text = f"{res['平均出来高 (株)']:,}株" if res['平均出来高 (株)'] != "-" else "-"
                     parts = [f"平均出来高: {vol_text}"]
@@ -543,7 +754,6 @@ with tab_screen:
                     msg = f"【スクリーニングヒット】\n{res['会社名']} ({res['コード']})\n" + " ｜ ".join(parts)
                     send_discord_notify(msg)
 
-                # 規模フィルターの切替（st.radio等）で再実行されても結果を保持できるようセッションに保存
                 st.session_state.last_screen_results = final_results
                 st.session_state.last_screen_counts = (len(codes), len(screen_results))
                 st.session_state.last_screen_conditions = (
@@ -591,7 +801,6 @@ with tab_screen:
                 "last_screen_conditions", (True, True, False)
             )
 
-            # 業種ごとにグループ化して表示（業種名でソート、銘柄が多い場合も見やすいようexpanderでまとめる）
             sectors = sorted({r["業種"] for r in display_results if r.get("業種")})
             group_by_sector = st.checkbox("🏭 業種ごとにグループ表示する", value=True, key="screen_group_by_sector")
 
@@ -641,10 +850,10 @@ with tab_list:
     if not df_jpx.empty:
         search_code_input = st.text_input("銘柄コードで検索（例: 4792, 7203）", value="")
         if search_code_input:
-            target_row = df_jpx[df_jpx['コード'].astype(str) == search_code_input.strip()]
+            code = search_code_input.strip()
+            target_row = df_jpx[df_jpx['コード_str'] == code]
             if not target_row.empty:
                 c_name = target_row.iloc[0]['銘柄名']
-                code = search_code_input.strip()
 
                 render_company_card(
                     c_name,
@@ -663,9 +872,15 @@ with tab_list:
                         with st.spinner("株価情報を取得中..."):
                             today = date.today()
                             jan1 = date(today.year, 1, 1)
-                            hist = get_price_history(
-                                code, jan1, today, st.session_state.data_source, jquants_api_key
-                            )
+                            from_s = jan1.strftime("%Y-%m-%d")
+                            to_s = today.strftime("%Y-%m-%d")
+
+                            if st.session_state.data_source == "J-Quants":
+                                hist = fetch_jquants_single(code, from_s, to_s, jquants_api_key)
+                            else:
+                                hist = fetch_yfinance_history(code, from_s, to_s)
+                            hist = trim_today(hist, st.session_state.exclude_today)
+
                             if hist is not None and not hist.empty:
                                 ytd_low = hist['Low'].min()
                                 latest_low = hist['Low'].iloc[-1]
@@ -679,6 +894,7 @@ with tab_list:
                                 )
                                 if avg_vol is not None and not pd.isna(avg_vol):
                                     st.markdown(f"📊 **直近20日間の平均出来高:** {int(round(avg_vol)):,}株")
+                                st.caption(f"最終データ日: {hist.index[-1].date()}")
 
                                 per_val = fetch_per_yfinance(code)
                                 st.markdown(f"💰 **PER:** {round(per_val, 2) if per_val else '-'} 倍（yfinance）")
@@ -727,7 +943,7 @@ with tab_list:
             if show_per and not display_df.empty:
                 with st.spinner("PERを取得中..."):
                     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as per_executor:
-                        codes_in_view = display_df['コード'].astype(str).tolist()
+                        codes_in_view = display_df['コード_str'].tolist()
                         per_futures = {
                             per_executor.submit(fetch_per_yfinance, c): c for c in codes_in_view
                         }
@@ -736,7 +952,7 @@ with tab_list:
                             per_map[c] = future.result()
 
             for _, row in display_df.iterrows():
-                code_str = str(row['コード'])
+                code_str = row['コード_str']
                 caption_parts = [
                     f"市場: {row['市場・商品区分']}",
                     f"業種: {row['33業種区分']}",
