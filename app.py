@@ -32,7 +32,7 @@ DECLINE_LOOKBACK_DAYS = 92
 ORE_TEKI_PRICE_MIN = 1000.0
 ORE_TEKI_PRICE_MAX = 2000.0
 
-st.set_page_config(page_title="株式スクリーニングツール", page_icon="📈", layout="wide")
+st.set_page_config(page_title="株価スクリーニング", page_icon="📈", layout="wide")
 
 
 def _secret(name, default=""):
