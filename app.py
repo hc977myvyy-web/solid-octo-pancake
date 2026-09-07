@@ -13,7 +13,7 @@ from datetime import date, timedelta
 _DEFAULTS = {
     "market_filter": "すべて",
     "sector_filter": "すべて",
-    "data_source": "yfinance",
+    "data_source": "J-Quants",
     "use_ytd_low": True,
     "use_decline": True,
     "use_ore_teki": False,
