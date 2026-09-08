@@ -32,7 +32,7 @@ DECLINE_LOOKBACK_DAYS = 92
 ORE_TEKI_PRICE_MIN = 1000.0
 ORE_TEKI_PRICE_MAX = 2000.0
 
-st.set_page_config(page_title="株価スクリーニング", page_icon="📈", layout="wide")
+st.set_page_config(page_title="株式スクリーニングツール", page_icon="📈", layout="wide")
 
 
 def _secret(name, default=""):
@@ -234,9 +234,16 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
     df = df[df["Code4"].notna()]
 
     # 調整済み（分割・併合・ライツイシュー）を使用
-    df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"})
+    # 調整済み（分割・併合・ライツイシュー）を優先し、欠損時は無調整値で埋める。
+    # AdjL が NaN のまま残ると安値比較が常にFalseになり、静かに全銘柄が落ちるため。
+    for adj_col, raw_col, out_col in [("AdjH", "H", "High"), ("AdjL", "L", "Low"),
+                                      ("AdjC", "C", "Close"), ("AdjVo", "Vo", "Volume")]:
+        adj = pd.to_numeric(df[adj_col], errors="coerce") if adj_col in df.columns else pd.Series(index=df.index, dtype=float)
+        raw = pd.to_numeric(df[raw_col], errors="coerce") if raw_col in df.columns else pd.Series(index=df.index, dtype=float)
+        df[out_col] = adj.fillna(raw)
     if "MktCap" not in df.columns:
         df["MktCap"] = pd.NA
+    df["MktCap"] = pd.to_numeric(df["MktCap"], errors="coerce")
 
     need = ["Date", "Code4", "High", "Low", "Close", "Volume", "MktCap"]
     missing = [c for c in need if c not in df.columns]
@@ -515,72 +522,93 @@ def trim_today(hist, exclude_today):
 
 def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct,
                 decline_lookback_days, use_ytd_low, use_decline, use_ore_teki,
-                price_min, price_max):
-    if hist is None or hist.empty:
-        return None
+                price_min, price_max, ytd_tolerance_pct=0.0, ytd_within_days=0,
+                combine_mode="AND", explain=False):
+    """
+    条件判定。explain=True のときは不合格でも計算過程を返す（デバッグ用）。
 
+    年初来安値の判定は2つのつまみで緩められる:
+      - ytd_tolerance_pct: 年初来安値からこの%以内なら「安値圏」とみなす
+      - ytd_within_days:   直近この営業日数以内に更新していればOK（0なら最終日のみ）
+    """
+    info = {"code": code, "avg_volume": None, "ytd_low": None, "ytd_recent_low": None,
+            "ytd_gap_pct": None, "ytd_low_hit": None, "recent_high": None,
+            "decline_pct": None, "latest_close": None, "mktcap": None,
+            "last_date": None, "rows": 0, "reason": None, "passed": False}
+
+    def _out(reason=None):
+        info["reason"] = reason
+        return info if explain else None
+
+    if hist is None or hist.empty:
+        return _out("データなし")
+
+    info["rows"] = len(hist)
+    info["last_date"] = hist.index[-1].date()
     today = date.today()
     jan1 = date(today.year, 1, 1)
     decline_from = today - timedelta(days=decline_lookback_days)
-    need_decline_data = use_decline or use_ore_teki
 
-    if len(hist) < lookback_days:
-        return None
-    avg_volume = hist['Volume'].tail(lookback_days).mean()
-    if pd.isna(avg_volume) or avg_volume < min_avg_volume:
-        return None
-
-    ytd_low_hit = decline_pct = latest_close = None
-
-    if use_ytd_low:
-        ytd_hist = hist[hist.index.date >= jan1]
-        if len(ytd_hist) < 2:
-            return None
-        ytd_low, latest_low = ytd_hist['Low'].min(), ytd_hist['Low'].iloc[-1]
-        if pd.isna(ytd_low) or pd.isna(latest_low):
-            return None
-        ytd_low_hit = latest_low <= ytd_low
-        if not ytd_low_hit:
-            return None
-
-    if need_decline_data:
-        if 'Close' not in hist.columns:
-            return None
-        recent_hist = hist[hist.index.date >= decline_from]
-        if len(recent_hist) < 2:
-            return None
-        recent_high, latest_close = recent_hist['High'].max(), hist['Close'].iloc[-1]
-        if pd.isna(recent_high) or pd.isna(latest_close) or recent_high <= 0:
-            return None
-        decline_pct = (recent_high - latest_close) / recent_high * 100
-        if decline_pct < decline_threshold_pct:
-            return None
-
-    if use_ore_teki:
-        if latest_close is None:
-            if 'Close' not in hist.columns:
-                return None
-            latest_close = hist['Close'].iloc[-1]
-        if pd.isna(latest_close) or not (price_min <= latest_close <= price_max):
-            return None
-
-    if latest_close is None and 'Close' in hist.columns:
-        latest_close = hist['Close'].iloc[-1]
-
-    mktcap = None
+    if 'Close' in hist.columns:
+        closes = hist['Close'].dropna()
+        if len(closes):
+            info["latest_close"] = float(closes.iloc[-1])
     if 'MktCap' in hist.columns:
         s = hist['MktCap'].dropna()
         if len(s):
-            mktcap = float(s.iloc[-1]) * 1e6  # 百万円 → 円
+            info["mktcap"] = float(s.iloc[-1]) * 1e6  # 百万円 → 円
 
-    return {
-        "code": code,
-        "avg_volume": avg_volume,
-        "ytd_low_hit": ytd_low_hit,
-        "decline_pct": decline_pct,
-        "latest_close": latest_close,
-        "mktcap": mktcap,
-    }
+    # --- 出来高（常に適用する足切り） ---
+    if len(hist) < lookback_days:
+        return _out(f"データ日数不足（{len(hist)}日 < {lookback_days}日）")
+    avg_volume = hist['Volume'].tail(lookback_days).mean()
+    info["avg_volume"] = None if pd.isna(avg_volume) else float(avg_volume)
+    if pd.isna(avg_volume) or avg_volume < min_avg_volume:
+        return _out(f"出来高不足（平均{avg_volume:,.0f}株 < {min_avg_volume:,}株）")
+
+    results = []
+
+    # --- 年初来安値 ---
+    if use_ytd_low:
+        lows = hist[hist.index.date >= jan1]['Low'].dropna()
+        if len(lows) < 2:
+            return _out("年初来のデータが不足")
+        ytd_low = float(lows.min())
+        recent_low = float(lows.tail(int(ytd_within_days) + 1).min())
+        info["ytd_low"], info["ytd_recent_low"] = ytd_low, recent_low
+        if ytd_low > 0:
+            info["ytd_gap_pct"] = (recent_low / ytd_low - 1) * 100
+        threshold = ytd_low * (1 + float(ytd_tolerance_pct) / 100.0)
+        info["ytd_low_hit"] = bool(recent_low <= threshold)
+        results.append(info["ytd_low_hit"])
+
+    # --- 直近3ヶ月高値からの下落率 ---
+    if use_decline or use_ore_teki:
+        recent = hist[hist.index.date >= decline_from]
+        highs, closes = recent['High'].dropna(), hist['Close'].dropna()
+        if len(recent) < 2 or not len(highs) or not len(closes):
+            return _out("下落率の計算に必要なデータが不足")
+        recent_high, latest_close = float(highs.max()), float(closes.iloc[-1])
+        info["recent_high"], info["latest_close"] = recent_high, latest_close
+        if recent_high <= 0:
+            return _out("高値が不正")
+        info["decline_pct"] = (recent_high - latest_close) / recent_high * 100
+        decline_ok = info["decline_pct"] >= decline_threshold_pct
+        if use_decline:
+            results.append(decline_ok)
+        if use_ore_teki:
+            results.append(decline_ok and price_min <= latest_close <= price_max)
+
+    if not results:
+        return _out("有効な条件が選択されていません")
+
+    passed = all(results) if combine_mode == "AND" else any(results)
+    info["passed"] = passed
+    if not passed:
+        return _out("条件を満たさず")
+
+    info["reason"] = "条件クリア"
+    return info
 
 
 def send_discord_notify(msg):
@@ -691,9 +719,12 @@ if not df_jpx.empty:
     sector_options = ["すべて"] + sorted(df_jpx['33業種区分'].unique().tolist())
 
 st.sidebar.header("⚙️ データソース設定")
+_SOURCES = ["J-Quants", "yfinance"]
 st.session_state.data_source = st.sidebar.radio(
-    "株価データの取得元", ["yfinance", "J-Quants"],
-    index=0 if st.session_state.data_source == "yfinance" else 1,
+    "株価データの取得元", _SOURCES,
+    index=_SOURCES.index(st.session_state.data_source)
+    if st.session_state.data_source in _SOURCES else 0,
+    help="J-Quantsは東証公式データ。yfinanceは登録不要ですが配当調整などの仕様が異なります。",
 )
 
 jquants_api_key = JQUANTS_API_KEY_SECRET
@@ -737,11 +768,7 @@ else:
 # メイン
 # ============================================================
 
-st.markdown(
-    "<h1 style='font-size:1.5rem; white-space:nowrap;'>📈 株価スクリーニング</h1>",
-    unsafe_allow_html=True,
-)
-
+st.title("📈 株式スクリーニングダッシュボード")
 
 with st.container(border=True):
     st.markdown("##### 🎛️ フィルターバー")
@@ -771,6 +798,21 @@ with st.container(border=True):
         f"🎯 俺的株（下落率約{DECLINE_THRESHOLD_PCT:.0f}%以上 かつ 株価"
         f"{ORE_TEKI_PRICE_MIN:,.0f}〜{ORE_TEKI_PRICE_MAX:,.0f}円）",
         value=st.session_state.use_ore_teki)
+
+    combine_mode = st.radio(
+        "複数条件の結合方法", ["AND（すべて満たす）", "OR（どれか1つ満たす）"],
+        horizontal=True, key="combine_mode_ui",
+        help="ANDだと『年初来安値更新』と『下落率20%以上』を同日に両方満たす銘柄しか出ません。",
+    ).startswith("AND") and "AND" or "OR"
+
+    with st.expander("⚙️ 年初来安値判定の調整（ヒットが少なすぎる場合はここを緩める）"):
+        a1, a2 = st.columns(2)
+        ytd_tolerance_pct = a1.slider(
+            "年初来安値からの許容幅（%）", 0.0, 10.0, 0.0, 0.5,
+            help="0%なら年初来安値と完全一致した日だけ。3%にすると安値圏で揉んでいる銘柄も拾います。")
+        ytd_within_days = a2.slider(
+            "直近何営業日以内の更新を見るか", 0, 20, 0, 1,
+            help="0なら最終営業日のみ。5にすると『この1週間で年初来安値を更新した』銘柄が対象になります。")
 
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
@@ -810,7 +852,11 @@ with tab_screen:
                           use_ytd_low=st.session_state.use_ytd_low,
                           use_decline=st.session_state.use_decline,
                           use_ore_teki=st.session_state.use_ore_teki,
-                          price_min=ORE_TEKI_PRICE_MIN, price_max=ORE_TEKI_PRICE_MAX)
+                          price_min=ORE_TEKI_PRICE_MIN, price_max=ORE_TEKI_PRICE_MAX,
+                          ytd_tolerance_pct=ytd_tolerance_pct,
+                          ytd_within_days=ytd_within_days,
+                          combine_mode=combine_mode)
+                st.session_state.last_screen_kw = kw
 
                 screen_results = []
 
@@ -875,6 +921,8 @@ with tab_screen:
                         "現在値 (円)": round(res["latest_close"], 1) if res.get("latest_close") is not None else "-",
                         "_mktcap": res.get("mktcap"),
                         "_close": res.get("latest_close"),
+                        "_ytd_low": res.get("ytd_low"),
+                        "_ytd_gap": res.get("ytd_gap_pct"),
                     })
 
                 # バリュエーション（時価総額・PER・PBR・PSR）をまとめて取得
@@ -931,12 +979,20 @@ with tab_screen:
                 if smap[sopt]:
                     display_results = [r for r in final_results if r.get("規模カテゴリ") == smap[sopt]]
 
-            sort_key = st.selectbox("並び替え", ["下落率が大きい順", "時価総額が大きい順",
-                                                 "時価総額が小さい順", "PBRが低い順", "PSRが低い順"],
-                                    key="screen_sort")
+            _sort_opts = ["年初来安値に近い順", "下落率が大きい順", "時価総額が大きい順",
+                          "時価総額が小さい順", "PBRが低い順", "PSRが低い順"]
+            used_ytd_pre = st.session_state.get("last_screen_conditions", (True, True, False))[0]
+            used_dec_pre = st.session_state.get("last_screen_conditions", (True, True, False))[1]
+            sort_key = st.selectbox(
+                "並び替え", _sort_opts,
+                index=0 if (used_ytd_pre and not used_dec_pre) else 1,
+                key="screen_sort")
 
             def _sk(r):
                 v = r.get("_val", {})
+                if sort_key == "年初来安値に近い順":
+                    g = r.get("_ytd_gap")
+                    return g if g is not None else float("inf")
                 if sort_key == "下落率が大きい順":
                     return -(r['下落率 (%)'] if r['下落率 (%)'] != "-" else -1)
                 if sort_key == "時価総額が大きい順":
@@ -961,6 +1017,10 @@ with tab_screen:
                 caps.append(f"直近{LOOKBACK_DAYS}日平均出来高: {res['平均出来高 (株)']:,}株")
                 if used_ytd:
                     caps.append("年初来安値更新: 該当")
+                    if res.get("_ytd_low"):
+                        gap = res.get("_ytd_gap")
+                        gap_txt = f"（乖離 {gap:+.2f}%）" if gap is not None else ""
+                        caps.append(f"年初来安値: {res['_ytd_low']:,.1f}円{gap_txt}")
                 if (used_dec or used_ore) and res['下落率 (%)'] != "-":
                     caps.append(f"3ヶ月高値からの下落率: {res['下落率 (%)']}%")
                 if res['現在値 (円)'] != "-":
@@ -1070,6 +1130,34 @@ with tab_list:
                 }
                 render_company_card(r0['銘柄名'], code, key_prefix="search",
                                     caption_parts=caps, mktcap=mktcap, val=val, facts=facts)
+
+                # --- 判定デバッグ：なぜこの銘柄が引っかからないのかを表示する ---
+                with st.expander("🔬 スクリーニング判定の内訳を見る"):
+                    kw_dbg = st.session_state.get("last_screen_kw")
+                    if not kw_dbg:
+                        st.info("一度スクリーニングを実行すると、そのときの条件で内訳を確認できます。")
+                    elif hist is None or hist.empty:
+                        st.warning("株価データが取得できていません。")
+                    else:
+                        d = screen_hist(code, hist, explain=True, **kw_dbg)
+                        st.markdown(f"**判定結果: {'✅ 通過' if d['passed'] else '❌ 除外'}** — {d['reason']}")
+                        rows = [
+                            ("取得データ日数", d["rows"]),
+                            ("最終データ日", d["last_date"]),
+                            (f"直近{kw_dbg['lookback_days']}日平均出来高",
+                             f"{d['avg_volume']:,.0f}株" if d["avg_volume"] else "-"),
+                            ("年初来安値", f"{d['ytd_low']:,.1f}円" if d["ytd_low"] else "-"),
+                            ("判定対象期間の最安値",
+                             f"{d['ytd_recent_low']:,.1f}円" if d["ytd_recent_low"] else "-"),
+                            ("年初来安値との乖離",
+                             f"{d['ytd_gap_pct']:+.2f}%" if d["ytd_gap_pct"] is not None else "-"),
+                            ("年初来安値の判定", d["ytd_low_hit"]),
+                            ("直近3ヶ月高値", f"{d['recent_high']:,.1f}円" if d["recent_high"] else "-"),
+                            ("最新終値", f"{d['latest_close']:,.1f}円" if d["latest_close"] else "-"),
+                            ("下落率", f"{d['decline_pct']:.1f}%" if d["decline_pct"] is not None else "-"),
+                        ]
+                        st.dataframe(pd.DataFrame(rows, columns=["項目", "値"]),
+                                     hide_index=True, use_container_width=True)
 
         st.markdown("---")
         st.markdown("###### 🏷️ 規模別一覧（TOPIXの規模区分に基づく）")
