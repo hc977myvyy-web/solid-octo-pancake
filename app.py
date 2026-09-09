@@ -19,6 +19,11 @@ _DEFAULTS = {
     "use_ore_teki": False,
     "exclude_today": True,
     "yf_fallback": True,
+    "use_macd": False, "use_heikin": False, "use_div": False,
+    "use_pbr": False, "use_psr": False, "use_op_growth": False, "use_op_margin": False,
+    "decline_thr": 17.0, "macd_within": 1, "macd_neg": True,
+    "div_min": 2.8, "pbr_max": 1.0, "psr_max": 1.0, "op_margin_min": 7.0,
+    "combine_ui": "AND（すべて満たす）",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -236,8 +241,9 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
     # 調整済み（分割・併合・ライツイシュー）を使用
     # 調整済み（分割・併合・ライツイシュー）を優先し、欠損時は無調整値で埋める。
     # AdjL が NaN のまま残ると安値比較が常にFalseになり、静かに全銘柄が落ちるため。
-    for adj_col, raw_col, out_col in [("AdjH", "H", "High"), ("AdjL", "L", "Low"),
-                                      ("AdjC", "C", "Close"), ("AdjVo", "Vo", "Volume")]:
+    for adj_col, raw_col, out_col in [("AdjO", "O", "Open"), ("AdjH", "H", "High"),
+                                      ("AdjL", "L", "Low"), ("AdjC", "C", "Close"),
+                                      ("AdjVo", "Vo", "Volume")]:
         adj = pd.to_numeric(df[adj_col], errors="coerce") if adj_col in df.columns else pd.Series(index=df.index, dtype=float)
         raw = pd.to_numeric(df[raw_col], errors="coerce") if raw_col in df.columns else pd.Series(index=df.index, dtype=float)
         df[out_col] = adj.fillna(raw)
@@ -245,7 +251,7 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
         df["MktCap"] = pd.NA
     df["MktCap"] = pd.to_numeric(df["MktCap"], errors="coerce")
 
-    need = ["Date", "Code4", "High", "Low", "Close", "Volume", "MktCap"]
+    need = ["Date", "Code4", "Open", "High", "Low", "Close", "Volume", "MktCap"]
     missing = [c for c in need if c not in df.columns]
     if missing:
         errors.append(f"レスポンスに必要な列がありません: {missing}")
@@ -253,7 +259,7 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
 
     df = df[need].sort_values("Date")
     panel = {
-        c: g.set_index("Date")[["High", "Low", "Close", "Volume", "MktCap"]]
+        c: g.set_index("Date")[["Open", "High", "Low", "Close", "Volume", "MktCap"]]
         for c, g in df.groupby("Code4", sort=False)
     }
     return panel, errors
@@ -290,45 +296,119 @@ def fetch_jquants_snapshot(api_key, asof_str):
     return {}
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_jquants_fins(code, api_key):
+# ============================================================
+# テクニカル指標
+# ============================================================
+
+def macd_hist(close, fast=12, slow=26, signal=9):
+    """MACDヒストグラム = MACD - シグナル。"""
+    macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    return macd - macd.ewm(span=signal, adjust=False).mean()
+
+
+def macd_trough_turn(hist, within_days=1, require_negative=True, min_bars=45):
     """
-    /fins/summary から最新の決算サマリーを取り、PBR/PSR/PERの計算材料を抽出する。
-    Lightプランでも利用可能。code指定なら1リクエストで全期間ぶん返る。
+    ヒストグラムの谷転換を検出する。
+    「i本目が前後より低い（=谷）」= その後が上向きに転じた状態。
+    within_days=1 なら最新の1本前が谷（最新足で反転を確認したところ）。
     """
-    if not api_key:
-        return {}
-    errors = []
-    recs = jq_request("/fins/summary", {"code": code}, api_key, errors)
+    h = hist.dropna()
+    if len(h) < min_bars:
+        return False, None, None
+    for k in range(1, int(within_days) + 1):
+        i = len(h) - 1 - k
+        if i < 1:
+            break
+        if h.iloc[i] < h.iloc[i - 1] and h.iloc[i] < h.iloc[i + 1]:
+            if (not require_negative) or h.iloc[i] < 0:
+                return True, h.index[i].date(), float(h.iloc[i])
+    return False, None, None
+
+
+def heikin_ashi(df):
+    """平均足の始値・終値。HA終値=(O+H+L+C)/4、HA始値=(前HA始値+前HA終値)/2。"""
+    ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4.0
+    prev = (float(df['Open'].iloc[0]) + float(df['Close'].iloc[0])) / 2.0
+    opens = []
+    for c in ha_close:
+        opens.append(prev)
+        prev = (prev + c) / 2.0
+    return pd.Series(opens, index=df.index), ha_close
+
+
+def pick_fundamentals(recs):
+    """
+    /fins/summary の全期間レコードから判定材料を取り出す。
+
+    - 予想年間配当は FDivAnn →（無ければ）NxFDivAnn → DivAnn実績 の順で新しい開示から探す。
+      配当予想の修正開示も拾えるよう、決算短信に限定しない。
+    - Sales/OP は期首からの累計値なので、前年同期比は同じ CurPerType 同士で比較する。
+    - 訂正開示は DiscNo が大きいほうが新しいため、昇順ソートの末尾を採用する。
+    """
     if not recs:
         return {}
-
     recs = sorted(recs, key=lambda r: (str(r.get("DiscDate") or ""), str(r.get("DiscNo") or "")))
-    latest = recs[-1]
+    out = {"disc_date": recs[-1].get("DiscDate")}
 
-    out = {
-        "disc_date": latest.get("DiscDate"),
-        "doc_type": latest.get("DocType"),
-        "period": latest.get("CurPerType"),
-        "bps": _num(latest.get("BPS")),
-        "eps_forecast": _num(latest.get("FEPS")),
-        "eps_actual": _num(latest.get("EPS")),
-        "equity": _num(latest.get("ShEq")) if _num(latest.get("ShEq")) else _num(latest.get("Eq")),
-        "roe": _num(latest.get("ROE")),
-        "op": _num(latest.get("OP")),
-        "op_forecast": _num(latest.get("FOP")),
-        "equity_ratio": _num(latest.get("EqAR")),
-    }
+    div, div_src = None, None
+    for key, label in [("FDivAnn", "会社予想(今期)"), ("NxFDivAnn", "会社予想(来期)"), ("DivAnn", "実績")]:
+        for r in reversed(recs):
+            v = _num(r.get(key))
+            if v is not None and v > 0:
+                div, div_src = v, label
+                break
+        if div is not None:
+            break
+    out["div_annual"], out["div_src"] = div, div_src
 
-    # PSR用の年間売上高：会社予想(通期) → 直近の通期実績 の順で採用
+    fs = [r for r in recs
+          if "FinancialStatements" in str(r.get("DocType", ""))
+          and str(r.get("CurPerType")) in ("1Q", "2Q", "3Q", "4Q", "FY")]
+    if not fs:
+        return out
+
+    latest = fs[-1]
+    out["period"] = latest.get("CurPerType")
+    op = _num(latest.get("OP")) if _num(latest.get("OP")) is not None else _num(latest.get("NCOP"))
+    sales = _num(latest.get("Sales")) if _num(latest.get("Sales")) is not None else _num(latest.get("NCSales"))
+    out["op"], out["sales"] = op, sales
+    if op is not None and sales and sales > 0:
+        out["op_margin_pct"] = op / sales * 100.0
+
+    prev = None
+    for r in reversed(fs[:-1]):
+        if r.get("CurPerType") == latest.get("CurPerType") and r.get("CurFYSt") != latest.get("CurFYSt"):
+            prev = r
+            break
+    if prev is not None:
+        prev_op = _num(prev.get("OP")) if _num(prev.get("OP")) is not None else _num(prev.get("NCOP"))
+        out["prev_op"] = prev_op
+        if op is not None and prev_op is not None:
+            out["op_growth"] = op > prev_op
+            if prev_op != 0:
+                out["op_growth_pct"] = (op - prev_op) / abs(prev_op) * 100.0
+
+    out["bps"] = _num(latest.get("BPS")) or _num(latest.get("NCBPS"))
+    out["equity"] = _num(latest.get("ShEq")) or _num(latest.get("Eq"))
+    out["eps_forecast"] = _num(latest.get("FEPS"))
     annual, src = _num(latest.get("FSales")), "会社予想(通期)"
     if annual is None:
-        for r in reversed(recs):
+        for r in reversed(fs):
             if str(r.get("CurPerType")) == "FY" and _num(r.get("Sales")):
                 annual, src = _num(r.get("Sales")), "直近通期実績"
                 break
     out["annual_sales"], out["sales_src"] = annual, (src if annual else None)
     return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_jquants_fins(code, api_key):
+    """/fins/summary から最新の決算サマリーを取得（Lightプランでも利用可）。"""
+    if not api_key:
+        return {}
+    errors = []
+    recs = jq_request("/fins/summary", {"code": code}, api_key, errors)
+    return pick_fundamentals(recs)
 
 
 def fetch_jquants_single(code, from_date_str, to_date_str, api_key):
@@ -345,8 +425,9 @@ def fetch_jquants_single(code, from_date_str, to_date_str, api_key):
         return pd.DataFrame()
     df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
     df = df.sort_values("Date").set_index("Date")
-    df = df.rename(columns={"AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"})
-    keep = [c for c in ["High", "Low", "Close", "Volume", "MktCap"] if c in df.columns]
+    df = df.rename(columns={"AdjO": "Open", "AdjH": "High", "AdjL": "Low",
+                            "AdjC": "Close", "AdjVo": "Volume"})
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume", "MktCap"] if c in df.columns]
     return df[keep]
 
 
@@ -366,7 +447,7 @@ def fetch_yfinance_history(code, from_date_str, to_date_str):
         hist = ticker.history(start=from_date_str, end=end_exclusive, auto_adjust=False)
         if hist.empty:
             return pd.DataFrame()
-        hist = hist[["High", "Low", "Close", "Volume"]].copy()
+        hist = hist[["Open", "High", "Low", "Close", "Volume"]].copy()
         hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
         return hist
     except Exception:
@@ -503,37 +584,70 @@ def claude_web_url(company_name, code, facts):
 # スクリーニング判定
 # ============================================================
 
-def compute_from_date(lookback_days, decline_lookback_days, use_ytd_low, need_decline_data):
+def compute_from_date(lookback_days, decline_lookback_days, use_ytd_low, need_decline_data,
+                      need_macd=False):
     today = date.today()
     cands = [today - timedelta(days=int(lookback_days * 2.5) + 10)]
     if use_ytd_low:
         cands.append(date(today.year, 1, 1))
     if need_decline_data:
         cands.append(today - timedelta(days=decline_lookback_days))
+    if need_macd:
+        # MACD(12,26,9)の収束と谷判定に最低でも60営業日ぶん欲しいので余裕をみる
+        cands.append(today - timedelta(days=260))
     return min(cands)
 
 
-def trim_today(hist, exclude_today):
-    """J-Quantsは大引け後更新、yfinanceは場中の途中経過が入るため揃える。"""
-    if not exclude_today or hist is None or hist.empty:
-        return hist
-    return hist[hist.index < pd.Timestamp(date.today())]
+def screen_fundamental(f, close, mktcap, need_div, div_min_pct, need_pbr, pbr_max,
+                       need_psr, psr_max, need_op_growth, need_op_margin, op_margin_min):
+    """
+    第2段階：財務条件の判定。
+    f は fetch_jquants_fins の戻り値、close は最新終値、mktcap は円建て時価総額。
+    戻り値: (判定リスト, 表示用の実測値dict)
+    """
+    m = {"div_yield": None, "div_annual": f.get("div_annual"), "div_src": f.get("div_src"),
+         "pbr": None, "psr": None, "op_margin_pct": f.get("op_margin_pct"),
+         "op_growth": f.get("op_growth"), "op_growth_pct": f.get("op_growth_pct"),
+         "period": f.get("period"), "disc_date": f.get("disc_date"),
+         "sales_src": f.get("sales_src")}
+
+    if close and f.get("div_annual"):
+        m["div_yield"] = f["div_annual"] / close * 100.0
+    if close and f.get("bps") and f["bps"] > 0:
+        m["pbr"] = close / f["bps"]
+    elif mktcap and f.get("equity") and f["equity"] > 0:
+        m["pbr"] = mktcap / f["equity"]
+    if mktcap and f.get("annual_sales") and f["annual_sales"] > 0:
+        m["psr"] = mktcap / f["annual_sales"]
+
+    checks = []
+    if need_div:
+        checks.append(m["div_yield"] is not None and m["div_yield"] >= div_min_pct)
+    if need_pbr:
+        checks.append(m["pbr"] is not None and m["pbr"] <= pbr_max)
+    if need_psr:
+        checks.append(m["psr"] is not None and m["psr"] <= psr_max)
+    if need_op_growth:
+        checks.append(m["op_growth"] is True)
+    if need_op_margin:
+        checks.append(m["op_margin_pct"] is not None and m["op_margin_pct"] >= op_margin_min)
+    return checks, m
 
 
 def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct,
                 decline_lookback_days, use_ytd_low, use_decline, use_ore_teki,
                 price_min, price_max, ytd_tolerance_pct=0.0, ytd_within_days=0,
-                combine_mode="AND", explain=False):
+                use_macd=False, macd_within_days=1, macd_require_negative=True,
+                use_heikin=False, combine_mode="AND", explain=False):
     """
-    条件判定。explain=True のときは不合格でも計算過程を返す（デバッグ用）。
-
-    年初来安値の判定は2つのつまみで緩められる:
-      - ytd_tolerance_pct: 年初来安値からこの%以内なら「安値圏」とみなす
-      - ytd_within_days:   直近この営業日数以内に更新していればOK（0なら最終日のみ）
+    第1段階：株価データだけで判定できる条件。
+    explain=True のときは不合格でも計算過程を返す（デバッグ用）。
     """
     info = {"code": code, "avg_volume": None, "ytd_low": None, "ytd_recent_low": None,
             "ytd_gap_pct": None, "ytd_low_hit": None, "recent_high": None,
             "decline_pct": None, "latest_close": None, "mktcap": None,
+            "macd_hit": None, "macd_trough_date": None, "macd_hist_last": None,
+            "heikin_bull": None, "ha_open": None, "ha_close": None,
             "last_date": None, "rows": 0, "reason": None, "passed": False}
 
     def _out(reason=None):
@@ -556,9 +670,8 @@ def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct
     if 'MktCap' in hist.columns:
         s = hist['MktCap'].dropna()
         if len(s):
-            info["mktcap"] = float(s.iloc[-1]) * 1e6  # 百万円 → 円
+            info["mktcap"] = float(s.iloc[-1]) * 1e6
 
-    # --- 出来高（常に適用する足切り） ---
     if len(hist) < lookback_days:
         return _out(f"データ日数不足（{len(hist)}日 < {lookback_days}日）")
     avg_volume = hist['Volume'].tail(lookback_days).mean()
@@ -568,7 +681,6 @@ def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct
 
     results = []
 
-    # --- 年初来安値 ---
     if use_ytd_low:
         lows = hist[hist.index.date >= jan1]['Low'].dropna()
         if len(lows) < 2:
@@ -578,11 +690,9 @@ def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct
         info["ytd_low"], info["ytd_recent_low"] = ytd_low, recent_low
         if ytd_low > 0:
             info["ytd_gap_pct"] = (recent_low / ytd_low - 1) * 100
-        threshold = ytd_low * (1 + float(ytd_tolerance_pct) / 100.0)
-        info["ytd_low_hit"] = bool(recent_low <= threshold)
+        info["ytd_low_hit"] = bool(recent_low <= ytd_low * (1 + float(ytd_tolerance_pct) / 100.0))
         results.append(info["ytd_low_hit"])
 
-    # --- 直近3ヶ月高値からの下落率 ---
     if use_decline or use_ore_teki:
         recent = hist[hist.index.date >= decline_from]
         highs, closes = recent['High'].dropna(), hist['Close'].dropna()
@@ -599,16 +709,44 @@ def screen_hist(code, hist, min_avg_volume, lookback_days, decline_threshold_pct
         if use_ore_teki:
             results.append(decline_ok and price_min <= latest_close <= price_max)
 
+    if use_macd:
+        closes = hist['Close'].dropna()
+        h = macd_hist(closes)
+        if len(h.dropna()):
+            info["macd_hist_last"] = float(h.dropna().iloc[-1])
+        hit, tdate, _tv = macd_trough_turn(h, within_days=macd_within_days,
+                                           require_negative=macd_require_negative)
+        info["macd_hit"], info["macd_trough_date"] = bool(hit), tdate
+        results.append(bool(hit))
+
+    if use_heikin:
+        if 'Open' not in hist.columns or hist['Open'].dropna().empty:
+            return _out("始値が無いため平均足を計算できません")
+        d = hist[['Open', 'High', 'Low', 'Close']].dropna()
+        if len(d) < 2:
+            return _out("平均足の計算に必要なデータが不足")
+        ha_o, ha_c = heikin_ashi(d)
+        info["ha_open"], info["ha_close"] = float(ha_o.iloc[-1]), float(ha_c.iloc[-1])
+        info["heikin_bull"] = bool(info["ha_close"] > info["ha_open"])
+        results.append(info["heikin_bull"])
+
     if not results:
         return _out("有効な条件が選択されていません")
 
     passed = all(results) if combine_mode == "AND" else any(results)
     info["passed"] = passed
     if not passed:
-        return _out("条件を満たさず")
+        return _out("株価系の条件を満たさず")
 
-    info["reason"] = "条件クリア"
+    info["reason"] = "第1段階クリア"
     return info
+
+
+def trim_today(hist, exclude_today):
+    """J-Quantsは大引け後更新、yfinanceは場中の途中経過が入るため揃える。"""
+    if not exclude_today or hist is None or hist.empty:
+        return hist
+    return hist[hist.index < pd.Timestamp(date.today())]
 
 
 def send_discord_notify(msg):
@@ -786,33 +924,56 @@ with st.container(border=True):
 
     st.markdown("---")
     st.markdown("###### 📉 スクリーニング条件")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.session_state.use_ytd_low = st.checkbox(
-            "年初来安値更新（当日の安値が年初来安値を更新）", value=st.session_state.use_ytd_low)
-    with c2:
-        st.session_state.use_decline = st.checkbox(
-            f"直近3ヶ月の高値からの下落率が約{DECLINE_THRESHOLD_PCT:.0f}%以上",
-            value=st.session_state.use_decline)
-    st.session_state.use_ore_teki = st.checkbox(
-        f"🎯 俺的株（下落率約{DECLINE_THRESHOLD_PCT:.0f}%以上 かつ 株価"
-        f"{ORE_TEKI_PRICE_MIN:,.0f}〜{ORE_TEKI_PRICE_MAX:,.0f}円）",
-        value=st.session_state.use_ore_teki)
 
-    combine_mode = st.radio(
-        "複数条件の結合方法", ["AND（すべて満たす）", "OR（どれか1つ満たす）"],
-        horizontal=True, key="combine_mode_ui",
-        help="ANDだと『年初来安値更新』と『下落率20%以上』を同日に両方満たす銘柄しか出ません。",
-    ).startswith("AND") and "AND" or "OR"
+    if st.button("⭐ プリセットを適用（下落17% / MACD谷転換 / 平均足陽線 / 配当2.8% / PBR・PSR 1倍以下 / 営業増益・利益率7%）"):
+        st.session_state.update({
+            "use_ytd_low": False, "use_decline": True, "use_ore_teki": False,
+            "use_macd": True, "use_heikin": True, "use_div": True,
+            "use_pbr": True, "use_psr": True, "use_op_growth": True, "use_op_margin": True,
+            "decline_thr": 17.0, "macd_within": 3, "macd_neg": True,
+            "div_min": 2.8, "pbr_max": 1.0, "psr_max": 1.0,
+            "op_margin_min": 7.0, "combine_ui": "AND（すべて満たす）",
+        })
+        st.rerun()
 
-    with st.expander("⚙️ 年初来安値判定の調整（ヒットが少なすぎる場合はここを緩める）"):
+    st.caption("**第1段階：株価から判定**（全銘柄に適用）")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.checkbox("直近高値からの下落率", key="use_decline")
+        decline_thr = st.number_input("下落率の下限（%）", 0.0, 90.0, step=0.5, key="decline_thr")
+        st.checkbox("MACDヒストグラムの谷転換", key="use_macd")
+        macd_within = st.number_input("谷転換を直近何本以内に見るか", 1, 15, step=1, key="macd_within")
+        macd_neg = st.checkbox("谷が0未満のときだけ有効", key="macd_neg")
+    with p2:
+        st.checkbox("平均足が陽線", key="use_heikin")
+        st.checkbox("年初来安値更新", key="use_ytd_low")
+        st.checkbox(f"🎯 俺的株（{ORE_TEKI_PRICE_MIN:,.0f}〜{ORE_TEKI_PRICE_MAX:,.0f}円）",
+                    key="use_ore_teki")
+
+    st.caption("**第2段階：財務から判定**（第1段階を通過した銘柄だけAPIを叩きます）")
+    q1, q2 = st.columns(2)
+    with q1:
+        st.checkbox("予想配当利回り", key="use_div")
+        div_min = st.number_input("配当利回りの下限（%）", 0.0, 20.0, step=0.1, key="div_min")
+        st.checkbox("営業利益が前年同期比で増益", key="use_op_growth")
+        st.checkbox("営業利益率", key="use_op_margin")
+        op_margin_min = st.number_input("営業利益率の下限（%）", 0.0, 90.0, step=0.5, key="op_margin_min")
+    with q2:
+        st.checkbox("PBR上限", key="use_pbr")
+        pbr_max = st.number_input("PBRの上限（倍）", 0.0, 20.0, step=0.1, key="pbr_max")
+        st.checkbox("PSR上限", key="use_psr")
+        psr_max = st.number_input("PSRの上限（倍）", 0.0, 20.0, step=0.1, key="psr_max")
+
+    combine_mode = "AND" if st.radio(
+        "第1段階の複数条件の結合方法", ["AND（すべて満たす）", "OR（どれか1つ満たす）"],
+        horizontal=True, key="combine_ui",
+        help="第2段階（財務条件）は常にANDで判定します。",
+    ).startswith("AND") else "OR"
+
+    with st.expander("⚙️ 年初来安値判定の調整"):
         a1, a2 = st.columns(2)
-        ytd_tolerance_pct = a1.slider(
-            "年初来安値からの許容幅（%）", 0.0, 10.0, 0.0, 0.5,
-            help="0%なら年初来安値と完全一致した日だけ。3%にすると安値圏で揉んでいる銘柄も拾います。")
-        ytd_within_days = a2.slider(
-            "直近何営業日以内の更新を見るか", 0, 20, 0, 1,
-            help="0なら最終営業日のみ。5にすると『この1週間で年初来安値を更新した』銘柄が対象になります。")
+        ytd_tolerance_pct = a1.slider("年初来安値からの許容幅（%）", 0.0, 10.0, 0.0, 0.5)
+        ytd_within_days = a2.slider("直近何営業日以内の更新を見るか", 0, 20, 0, 1)
 
     search_btn = st.button("🚀 スクリーニングを実行する", type="primary", use_container_width=True)
 
@@ -842,12 +1003,13 @@ with tab_screen:
             else:
                 need_decline = st.session_state.use_decline or st.session_state.use_ore_teki
                 from_dt = compute_from_date(LOOKBACK_DAYS, DECLINE_LOOKBACK_DAYS,
-                                            st.session_state.use_ytd_low, need_decline)
+                                            st.session_state.use_ytd_low, need_decline,
+                                            need_macd=st.session_state.use_macd)
                 from_str = from_dt.strftime("%Y-%m-%d")
                 to_str = date.today().strftime("%Y-%m-%d")
 
                 kw = dict(min_avg_volume=MIN_AVG_VOLUME, lookback_days=LOOKBACK_DAYS,
-                          decline_threshold_pct=DECLINE_THRESHOLD_PCT,
+                          decline_threshold_pct=decline_thr,
                           decline_lookback_days=DECLINE_LOOKBACK_DAYS,
                           use_ytd_low=st.session_state.use_ytd_low,
                           use_decline=st.session_state.use_decline,
@@ -855,6 +1017,9 @@ with tab_screen:
                           price_min=ORE_TEKI_PRICE_MIN, price_max=ORE_TEKI_PRICE_MAX,
                           ytd_tolerance_pct=ytd_tolerance_pct,
                           ytd_within_days=ytd_within_days,
+                          use_macd=st.session_state.use_macd,
+                          macd_within_days=macd_within, macd_require_negative=macd_neg,
+                          use_heikin=st.session_state.use_heikin,
                           combine_mode=combine_mode)
                 st.session_state.last_screen_kw = kw
 
@@ -903,7 +1068,38 @@ with tab_screen:
 
                 m1, m2 = st.columns(2)
                 m1.metric("① 対象銘柄数", f"{len(codes)} 件")
-                m2.metric("② 条件クリア", f"{len(screen_results)} 件")
+                m2.metric("② 第1段階クリア", f"{len(screen_results)} 件")
+
+                # ---------- 第2段階：財務条件 ----------
+                fund_flags = dict(
+                    need_div=st.session_state.use_div, div_min_pct=div_min,
+                    need_pbr=st.session_state.use_pbr, pbr_max=pbr_max,
+                    need_psr=st.session_state.use_psr, psr_max=psr_max,
+                    need_op_growth=st.session_state.use_op_growth,
+                    need_op_margin=st.session_state.use_op_margin,
+                    op_margin_min=op_margin_min)
+                use_fund = any([fund_flags["need_div"], fund_flags["need_pbr"], fund_flags["need_psr"],
+                                fund_flags["need_op_growth"], fund_flags["need_op_margin"]])
+
+                if use_fund and screen_results:
+                    if not jquants_api_key:
+                        st.error("財務条件を使うにはJ-Quants APIキーが必要です。")
+                        screen_results = []
+                    else:
+                        kept = []
+                        bar2 = st.progress(0, text=f"財務データを取得中（{len(screen_results)}銘柄）...")
+                        for i, res in enumerate(screen_results):
+                            f = fetch_jquants_fins(res["code"], jquants_api_key)
+                            checks, metrics = screen_fundamental(
+                                f, res.get("latest_close"), res.get("mktcap"), **fund_flags)
+                            res["_fund"] = metrics
+                            if f and all(checks):
+                                kept.append(res)
+                            bar2.progress((i + 1) / len(screen_results),
+                                          text=f"財務データを取得中... ({i+1}/{len(screen_results)})")
+                        bar2.empty()
+                        st.metric("③ 財務条件クリア", f"{len(kept)} 件")
+                        screen_results = kept
 
                 final_results = []
                 for res in screen_results:
@@ -923,6 +1119,9 @@ with tab_screen:
                         "_close": res.get("latest_close"),
                         "_ytd_low": res.get("ytd_low"),
                         "_ytd_gap": res.get("ytd_gap_pct"),
+                        "_macd_date": res.get("macd_trough_date"),
+                        "_heikin": res.get("heikin_bull"),
+                        "_fund": res.get("_fund"),
                     })
 
                 # バリュエーション（時価総額・PER・PBR・PSR）をまとめて取得
@@ -979,8 +1178,8 @@ with tab_screen:
                 if smap[sopt]:
                     display_results = [r for r in final_results if r.get("規模カテゴリ") == smap[sopt]]
 
-            _sort_opts = ["年初来安値に近い順", "下落率が大きい順", "時価総額が大きい順",
-                          "時価総額が小さい順", "PBRが低い順", "PSRが低い順"]
+            _sort_opts = ["年初来安値に近い順", "下落率が大きい順", "配当利回りが高い順",
+                          "時価総額が大きい順", "時価総額が小さい順", "PBRが低い順", "PSRが低い順"]
             used_ytd_pre = st.session_state.get("last_screen_conditions", (True, True, False))[0]
             used_dec_pre = st.session_state.get("last_screen_conditions", (True, True, False))[1]
             sort_key = st.selectbox(
@@ -995,6 +1194,8 @@ with tab_screen:
                     return g if g is not None else float("inf")
                 if sort_key == "下落率が大きい順":
                     return -(r['下落率 (%)'] if r['下落率 (%)'] != "-" else -1)
+                if sort_key == "配当利回りが高い順":
+                    return -((r.get("_fund") or {}).get("div_yield") or 0)
                 if sort_key == "時価総額が大きい順":
                     return -(r.get("_mktcap") or 0)
                 if sort_key == "時価総額が小さい順":
@@ -1010,7 +1211,13 @@ with tab_screen:
                 "last_screen_conditions", (True, True, False))
 
             def render_result_card(res):
-                v = res.get("_val", {})
+                v = dict(res.get("_val") or {})
+                fdm = res.get("_fund") or {}
+                for k in ("pbr", "psr"):
+                    if fdm.get(k) is not None:
+                        v[k] = fdm[k]
+                if fdm.get("disc_date"):
+                    v["disc_date"] = fdm["disc_date"]
                 caps = [f"市場: {res['市場']}", f"業種: {res['業種']}"]
                 if res.get("規模カテゴリ"):
                     caps.append(f"規模: {res['規模カテゴリ']}")
@@ -1025,6 +1232,19 @@ with tab_screen:
                     caps.append(f"3ヶ月高値からの下落率: {res['下落率 (%)']}%")
                 if res['現在値 (円)'] != "-":
                     caps.append(f"現在値: {res['現在値 (円)']}円")
+                if res.get("_macd_date"):
+                    caps.append(f"MACD谷転換: {res['_macd_date']}")
+                if res.get("_heikin") is not None:
+                    caps.append(f"平均足: {'陽線' if res['_heikin'] else '陰線'}")
+                fd = res.get("_fund") or {}
+                if fd.get("div_yield") is not None:
+                    caps.append(f"予想配当利回り: {fd['div_yield']:.2f}%"
+                                + (f"（{fd['div_src']} {fd['div_annual']:,.1f}円）" if fd.get("div_src") else ""))
+                if fd.get("op_margin_pct") is not None:
+                    caps.append(f"営業利益率: {fd['op_margin_pct']:.1f}%"
+                                + (f"（{fd['period']}累計）" if fd.get("period") else ""))
+                if fd.get("op_growth_pct") is not None:
+                    caps.append(f"営業利益 前年同期比: {fd['op_growth_pct']:+.1f}%")
 
                 facts = {
                     "市場": res['市場'], "業種": res['業種'],
@@ -1036,6 +1256,11 @@ with tab_screen:
                     "年初来安値更新": "該当" if used_ytd else None,
                     "直近20日平均出来高": f"{res['平均出来高 (株)']:,}株",
                     "最新決算開示日": v.get("disc_date"),
+                    "予想配当利回り": f"{fdm['div_yield']:.2f}%" if fdm.get("div_yield") is not None else None,
+                    "営業利益率": f"{fdm['op_margin_pct']:.1f}%" if fdm.get("op_margin_pct") is not None else None,
+                    "営業利益 前年同期比": f"{fdm['op_growth_pct']:+.1f}%" if fdm.get("op_growth_pct") is not None else None,
+                    "MACD谷転換日": str(res.get("_macd_date")) if res.get("_macd_date") else None,
+                    "平均足": ("陽線" if res.get("_heikin") else "陰線") if res.get("_heikin") is not None else None,
                 }
                 render_company_card(res["会社名"], res["コード"], key_prefix="screen",
                                     caption_parts=caps, mktcap=res.get("_mktcap"),
@@ -1155,6 +1380,14 @@ with tab_list:
                             ("直近3ヶ月高値", f"{d['recent_high']:,.1f}円" if d["recent_high"] else "-"),
                             ("最新終値", f"{d['latest_close']:,.1f}円" if d["latest_close"] else "-"),
                             ("下落率", f"{d['decline_pct']:.1f}%" if d["decline_pct"] is not None else "-"),
+                            ("MACDヒストグラム(最新)",
+                             f"{d['macd_hist_last']:.3f}" if d["macd_hist_last"] is not None else "-"),
+                            ("MACD谷転換", f"{d['macd_hit']}（谷: {d['macd_trough_date']}）"
+                             if d["macd_hit"] is not None else "-"),
+                            ("平均足", ("陽線" if d["heikin_bull"] else "陰線")
+                             if d["heikin_bull"] is not None else "-"),
+                            ("平均足 始値/終値",
+                             f"{d['ha_open']:,.1f} / {d['ha_close']:,.1f}" if d["ha_open"] else "-"),
                         ]
                         st.dataframe(pd.DataFrame(rows, columns=["項目", "値"]),
                                      hide_index=True, use_container_width=True)
