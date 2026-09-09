@@ -1,3 +1,4 @@
+import gc
 import time
 import json
 import threading
@@ -5,6 +6,7 @@ import urllib.parse
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import requests
 import concurrent.futures
 from datetime import date, timedelta
@@ -214,7 +216,41 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
     if len(dates) == 0:
         return {}, []
 
-    errors, all_records = [], []
+    errors, frames = [], []
+    keep_src = [("AdjO", "O", "Open"), ("AdjH", "H", "High"), ("AdjL", "L", "Low"),
+                ("AdjC", "C", "Close"), ("AdjVo", "Vo", "Volume")]
+
+    def _to_frame(records):
+        """
+        1営業日分のレコードを、必要列だけの小さなDataFrameに変換する。
+
+        約68万件の辞書をリストに溜めてから pd.DataFrame() に渡すとメモリのピークが
+        跳ね上がり、Streamlit Community Cloudのメモリ枠で落ちる。日次で刈り込み、
+        float32に落としてから連結することでピークを抑える。
+
+        調整済み（分割・併合・ライツイシュー）を優先し、欠損時は無調整値で埋める。
+        AdjLがNaNのまま残ると安値比較が常にFalseになり、静かに全銘柄が落ちるため。
+        """
+        if not records:
+            return None
+        d = pd.DataFrame(records)
+        if "Date" not in d.columns or "Code" not in d.columns:
+            return None
+        d["Code4"] = d["Code"].astype(str).map(to_4digit)
+        d = d[d["Code4"].notna()]
+        if d.empty:
+            return None
+        out = pd.DataFrame({"Date": pd.to_datetime(d["Date"]).dt.normalize(),
+                            "Code4": d["Code4"].values})
+        empty = pd.Series(index=d.index, dtype="float64")
+        for adj_col, raw_col, out_col in keep_src:
+            adj = pd.to_numeric(d[adj_col], errors="coerce") if adj_col in d.columns else empty
+            raw = pd.to_numeric(d[raw_col], errors="coerce") if raw_col in d.columns else empty
+            out[out_col] = adj.fillna(raw).astype("float32").values
+        out["MktCap"] = (pd.to_numeric(d["MktCap"], errors="coerce").astype("float32").values
+                         if "MktCap" in d.columns else np.nan)
+        return out
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=JQ_MAX_WORKERS) as ex:
         futures = [
             ex.submit(jq_request, "/equities/bars/daily",
@@ -222,46 +258,22 @@ def fetch_jquants_panel(from_date_str, to_date_str, api_key, _progress=None):
             for d in dates
         ]
         for i, fut in enumerate(concurrent.futures.as_completed(futures)):
-            all_records.extend(fut.result())
+            f = _to_frame(fut.result())
+            if f is not None:
+                frames.append(f)
             if _progress:
                 _progress((i + 1) / len(futures), i + 1, len(futures))
 
-    if not all_records:
+    if not frames:
         return {}, errors
 
-    df = pd.DataFrame(all_records)
-    if "Date" not in df.columns or "Code" not in df.columns:
-        errors.append("レスポンスに Date / Code 列がありません。")
-        return {}, errors
-
-    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
-    df["Code4"] = df["Code"].astype(str).map(to_4digit)
-    df = df[df["Code4"].notna()]
-
-    # 調整済み（分割・併合・ライツイシュー）を使用
-    # 調整済み（分割・併合・ライツイシュー）を優先し、欠損時は無調整値で埋める。
-    # AdjL が NaN のまま残ると安値比較が常にFalseになり、静かに全銘柄が落ちるため。
-    for adj_col, raw_col, out_col in [("AdjO", "O", "Open"), ("AdjH", "H", "High"),
-                                      ("AdjL", "L", "Low"), ("AdjC", "C", "Close"),
-                                      ("AdjVo", "Vo", "Volume")]:
-        adj = pd.to_numeric(df[adj_col], errors="coerce") if adj_col in df.columns else pd.Series(index=df.index, dtype=float)
-        raw = pd.to_numeric(df[raw_col], errors="coerce") if raw_col in df.columns else pd.Series(index=df.index, dtype=float)
-        df[out_col] = adj.fillna(raw)
-    if "MktCap" not in df.columns:
-        df["MktCap"] = pd.NA
-    df["MktCap"] = pd.to_numeric(df["MktCap"], errors="coerce")
-
-    need = ["Date", "Code4", "Open", "High", "Low", "Close", "Volume", "MktCap"]
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        errors.append(f"レスポンスに必要な列がありません: {missing}")
-        return {}, errors
-
-    df = df[need].sort_values("Date")
-    panel = {
-        c: g.set_index("Date")[["Open", "High", "Low", "Close", "Volume", "MktCap"]]
-        for c, g in df.groupby("Code4", sort=False)
-    }
+    df = pd.concat(frames, ignore_index=True)
+    frames.clear()
+    df = df.sort_values("Date")
+    cols = ["Open", "High", "Low", "Close", "Volume", "MktCap"]
+    panel = {c: g.set_index("Date")[cols] for c, g in df.groupby("Code4", sort=False)}
+    del df
+    gc.collect()
     return panel, errors
 
 
